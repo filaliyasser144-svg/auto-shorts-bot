@@ -29,6 +29,7 @@ GAP = 0.45  # أي صمت أطول من هذا (بالثواني) يُحذف
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 
+# ---------------------------------------------------------------- helpers
 def run_cmd(cmd):
     cmd = [str(c) for c in cmd]
     print("$", " ".join(cmd), flush=True)
@@ -58,15 +59,37 @@ def send_video(path, caption):
         print("send error:", r.text)
 
 
+# ---------------------------------------------------------------- steps
 def download():
     WORK.mkdir(exist_ok=True)
     OUT.mkdir(exist_ok=True)
-    cmd = ["yt-dlp", "--no-playlist", "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
-           "--merge-output-format", "mp4", "-o", WORK / "src.%(ext)s"]
+    base = ["yt-dlp", "--no-playlist", "--merge-output-format", "mp4",
+            "-o", str(WORK / "src.%(ext)s")]
     if pathlib.Path("cookies.txt").exists():
-        cmd += ["--cookies", "cookies.txt"]
-    run_cmd(cmd + [URL])
-    return WORK / "src.mp4"
+        base += ["--cookies", "cookies.txt"]
+    attempts = [
+        ["-f", "bv*[height<=1080]+ba/b[height<=1080]/b"],
+        ["-f", "b", "--extractor-args", "youtube:player_client=tv,web_safari"],
+        ["-f", "b", "--extractor-args", "youtube:player_client=android_vr"],
+        ["-f", "b", "--extractor-args", "youtube:player_client=mweb"],
+    ]
+    last = "unknown error"
+    for extra in attempts:
+        cmd = base + extra + [URL]
+        print("$", " ".join(cmd), flush=True)
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        print(r.stdout[-1500:])
+        print(r.stderr[-1500:])
+        files = [f for f in WORK.glob("src.*") if f.suffix not in (".part", ".ytdl")]
+        if r.returncode == 0 and files:
+            f = files[0]
+            if f.suffix != ".mp4":
+                run_cmd(["ffmpeg", "-y", "-i", f, "-c:v", "libx264", "-preset", "veryfast",
+                         "-crf", "20", "-c:a", "aac", WORK / "src.mp4"])
+            return WORK / "src.mp4"
+        errs = [l for l in r.stderr.splitlines() if l.startswith("ERROR")]
+        last = errs[-1] if errs else last
+    raise RuntimeError(last)
 
 
 def transcribe(src):
@@ -180,6 +203,7 @@ def face_center(src, start, dur):
     return 0.5, 0.4
 
 
+# ---------------------------------------------------------------- captions
 def ts(t):
     t = max(t, 0)
     return f"{int(t // 3600)}:{int(t % 3600 // 60):02d}:{t % 60:05.2f}"
@@ -218,6 +242,7 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 
 
 def build_ass(segs, hook, total, path):
+    # إعادة حساب أزمنة الكلمات بعد حذف الصمت
     ws, off = [], 0.0
     for sg in segs:
         for w in sg["words"]:
@@ -241,6 +266,7 @@ def build_ass(segs, hook, total, path):
         lines.append(f"Dialogue: 1,{ts(0.15)},{ts(min(3.8, total))},Hook,,0,0,0,,"
                      f"{{\\fad(200,300)}}{esc(hook)}")
 
+    # شريط التقدم
     ms = int(total * 1000)
     lines.append(f"Dialogue: 5,{ts(0)},{ts(total)},Cap,,0,0,0,,"
                  f"{{\\an7\\pos(0,1890)\\fscx0\\t(0,{ms},\\fscx100)\\1c&H00D7FF&\\bord0\\shad0\\p1}}"
@@ -248,6 +274,7 @@ def build_ass(segs, hook, total, path):
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+# ---------------------------------------------------------------- render
 def build_segments(cw, start):
     segs = []
     for w in cw:
@@ -317,6 +344,7 @@ def render(idx, clip, src, words, sw, sh):
     return out
 
 
+# ---------------------------------------------------------------- main
 def main():
     try:
         say("⬇️ جاري تحميل الفيديو...")
@@ -347,7 +375,7 @@ def main():
         raise
     except Exception:
         traceback.print_exc()
-        say("❌ حدث خطأ أثناء المعالجة. راجع سجل Actions في GitHub.")
+        say("❌ حدث خطأ: " + str(sys.exc_info()[1])[:300])
         sys.exit(1)
 
 

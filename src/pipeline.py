@@ -20,7 +20,7 @@ URL = os.environ["VIDEO_URL"]
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT = os.environ["TELEGRAM_CHAT_ID"]
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY") or ""
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or ""
 WHISPER = os.environ.get("WHISPER_MODEL") or "small"
 LANG = os.environ.get("LANG_CODE") or None
 N_CLIPS = int(os.environ.get("NUM_CLIPS") or "5")
@@ -128,6 +128,26 @@ def non_overlapping(clips, n):
     return sorted(chosen, key=lambda c: c["start"])
 
 
+def gemini_models():
+    if GEMINI_MODEL:
+        return [GEMINI_MODEL]
+    names = []
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                         params={"key": GEMINI_KEY, "pageSize": 200}, timeout=30)
+        r.raise_for_status()
+        names = [m["name"].split("/")[-1] for m in r.json().get("models", [])
+                 if "generateContent" in m.get("supportedGenerationMethods", [])]
+    except Exception as e:  # noqa
+        print("list models failed:", e)
+    bad = ("lite", "image", "tts", "live", "audio", "embed", "vision", "robotics",
+           "computer", "exp", "customtools", "thinking")
+    flash = [n for n in names if "flash" in n and not any(x in n for x in bad)]
+    stable = sorted([n for n in flash if "preview" not in n], reverse=True)
+    prev = sorted([n for n in flash if "preview" in n], reverse=True)
+    return (stable + prev)[:4] or ["gemini-2.5-flash"]
+
+
 def gemini_pick(sentences):
     lines = "\n".join(f"[{s['start']:.1f}] {s['text']}" for s in sentences)
     prompt = (
@@ -140,19 +160,28 @@ def gemini_pick(sentences):
         'in the same language as the transcript","title":"short caption title","score":0-100}]'
         "\n\nTRANSCRIPT:\n" + lines
     )
-    r = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-        params={"key": GEMINI_KEY},
-        json={"contents": [{"parts": [{"text": prompt}]}],
-              "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4}},
-        timeout=300,
-    )
-    r.raise_for_status()
-    txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    data = json.loads(txt)
-    return [snap({"start": float(c["start"]), "end": float(c["end"]),
-                  "hook": c.get("hook", ""), "title": c.get("title", ""),
-                  "score": c.get("score", 50)}, sentences) for c in data]
+    last = None
+    for model in gemini_models():
+        try:
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                params={"key": GEMINI_KEY},
+                json={"contents": [{"parts": [{"text": prompt}]}],
+                      "generationConfig": {"responseMimeType": "application/json",
+                                           "temperature": 0.4}},
+                timeout=300,
+            )
+            r.raise_for_status()
+            txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            data = json.loads(txt)
+            print("Gemini model used:", model)
+            return [snap({"start": float(c["start"]), "end": float(c["end"]),
+                          "hook": c.get("hook", ""), "title": c.get("title", ""),
+                          "score": c.get("score", 50)}, sentences) for c in data]
+        except Exception as e:  # noqa
+            print("Gemini model", model, "failed:", e)
+            last = e
+    raise last or RuntimeError("no Gemini model available")
 
 
 def fallback_pick(sentences):
@@ -176,30 +205,34 @@ def pick_clips(sentences):
             cands = gemini_pick(sentences)
         except Exception as e:  # noqa
             print("Gemini failed, using fallback:", e)
+            say("⚠️ Gemini لم يعمل، سأختار المقاطع بطريقة تلقائية بسيطة.")
     if not cands:
         cands = fallback_pick(sentences)
     return non_overlapping(cands, N_CLIPS)
 
 
 def face_center(src, start, dur):
-    cap = cv2.VideoCapture(str(src))
-    det = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    xs, ys = [], []
-    for t in np.arange(start, start + dur, 1.0):
-        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-        ok, frame = cap.read()
-        if not ok:
-            continue
-        g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        h, w = g.shape
-        faces = det.detectMultiScale(g, 1.2, 5, minSize=(w // 20, w // 20))
-        if len(faces):
-            x, y, fw, fh = max(faces, key=lambda b: b[2] * b[3])
-            xs.append((x + fw / 2) / w)
-            ys.append((y + fh / 2) / h)
-    cap.release()
-    if xs:
-        return float(np.median(xs)), float(np.median(ys))
+    try:
+        cap = cv2.VideoCapture(str(src))
+        det = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        xs, ys = [], []
+        for t in np.arange(start, start + dur, 1.0):
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            h, w = g.shape
+            faces = det.detectMultiScale(g, 1.2, 5, minSize=(w // 20, w // 20))
+            if len(faces):
+                x, y, fw, fh = max(faces, key=lambda b: b[2] * b[3])
+                xs.append((x + fw / 2) / w)
+                ys.append((y + fh / 2) / h)
+        cap.release()
+        if xs:
+            return float(np.median(xs)), float(np.median(ys))
+    except Exception as e:  # noqa
+        print("face detection unavailable, using center crop:", e)
     return 0.5, 0.4
 
 

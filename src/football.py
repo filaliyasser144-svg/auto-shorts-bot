@@ -17,7 +17,8 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT = os.environ["TELEGRAM_CHAT_ID"]
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY") or ""
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or ""
-TARGET_MIN = min(max(float(os.environ.get("TARGET_MIN") or "12"), 5.0), 25.0)
+FORMAT = (os.environ.get("FOOTBALL_FORMAT") or "vertical").lower()   # vertical (تيك توك/ريلز) | wide
+TARGET_MIN = min(max(float(os.environ.get("TARGET_MIN") or ("3" if FORMAT == "vertical" else "12")), 1.0), 25.0)
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 # مدة كل لقطة (بناء الهجمة قبل اللحظة + الاحتفال والإعادة بعدها)
@@ -179,9 +180,13 @@ def classify(src, cand):
 
 
 # ---------------------------------------------------------------- 3) choose moments to reach the target length
-def clip_window(c, total):
+def clip_window(c, total, target_s=720.0):
+    """اللقطات تقصر تلقائياً كلما كان الملخص المطلوب أقصر."""
     ev = c.get("event", "unknown")
-    return max(c["t"] - LEAD[ev], 0), min(c["t"] + TAIL[ev], total)
+    scale = min(1.0, max(0.35, target_s / 600.0))
+    lead = max(LEAD[ev] * scale, 8)
+    tail = max(TAIL[ev] * scale, 8)
+    return max(c["t"] - lead, 0), min(c["t"] + tail, total)
 
 
 def choose(cands, total, target_s):
@@ -194,7 +199,7 @@ def choose(cands, total, target_s):
             continue
         if c["event"] == "other":
             continue
-        a, b = clip_window(c, total)
+        a, b = clip_window(c, total, target_s)
         if length + (b - a) > target_s * 1.15 and chosen:
             continue
         chosen.append(c)
@@ -203,27 +208,38 @@ def choose(cands, total, target_s):
             break
     if length < 0.5 * target_s:          # لا يوجد ما يكفي من اللقطات المؤكدة: أكمل بالأقوى صوتاً
         for c in sorted(cands, key=lambda c: -c["rank"]):
-            if c in chosen or length >= 0.5 * target_s:
+            if c in chosen or c["event"] == "other" or length >= 0.5 * target_s:
                 continue
-            a, b = clip_window(c, total)
+            a, b = clip_window(c, total, target_s)
             chosen.append(c)
             length += b - a
     return sorted(chosen, key=lambda c: c["t"]), length
 
 
 # ---------------------------------------------------------------- 4) cut, fade, join (no text, no music)
-def build(src, chosen, total):
+def clip_filter(d):
+    """عمودي 1080x1920: اللقطة كاملة في الوسط وخلفها نسخة مموهة منها (بدون أي نص)."""
+    fade = f"fade=t=in:st=0:d=0.3,fade=t=out:st={d - 0.3:.2f}:d=0.3"
+    if FORMAT == "vertical":
+        return ("[0:v]split=2[bg][fg];"
+                "[bg]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,"
+                "boxblur=10:2,scale=1080:1920,eq=brightness=-0.08[b];"
+                "[fg]scale=1080:-2[f];"
+                f"[b][f]overlay=(W-w)/2:(H-h)/2,setsar=1,fps=30,{fade}[v]")
+    return ("[0:v]scale=1280:720:force_original_aspect_ratio=decrease,"
+            f"pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,{fade}[v]")
+
+
+def build(src, chosen, total, target_s=720.0):
     clips = []
     for i, c in enumerate(chosen, 1):
-        a, b = clip_window(c, total)
+        a, b = clip_window(c, total, target_s)
         d = b - a
         out = WORK / f"clip{i:02d}.mp4"
-        vf = ("scale=1280:720:force_original_aspect_ratio=decrease,"
-              "pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,"
-              f"fade=t=in:st=0:d=0.3,fade=t=out:st={d - 0.3:.2f}:d=0.3")
         af = f"aresample=48000,afade=t=in:st=0:d=0.3,afade=t=out:st={d - 0.3:.2f}:d=0.3"
         run_cmd(["ffmpeg", "-y", "-ss", f"{a:.2f}", "-t", f"{d:.2f}", "-i", src,
-                 "-vf", vf, "-af", af, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                 "-filter_complex", clip_filter(d), "-map", "[v]", "-map", "0:a?", "-af", af,
+                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
                  "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-ar", "48000", out])
         clips.append(out)
     lst = WORK / "concat.txt"
@@ -232,6 +248,17 @@ def build(src, chosen, total):
     run_cmd(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy",
              "-movflags", "+faststart", final])
     return final
+
+
+def shrink_for_telegram(final, dur):
+    """نسخة أخف (أقل من 50MB) لإرسالها في تلغرام، والأصلية تبقى في Artifacts."""
+    vb = max(int(46 * 8 * 1024 / dur - 128), 500)      # kbps
+    small = OUT / "football_summary_telegram.mp4"
+    scale = "scale=720:1280" if FORMAT == "vertical" else "scale=960:540"
+    run_cmd(["ffmpeg", "-y", "-i", final, "-vf", scale, "-c:v", "libx264", "-preset", "veryfast",
+             "-b:v", f"{vb}k", "-maxrate", f"{int(vb * 1.3)}k", "-bufsize", f"{vb * 2}k",
+             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", small])
+    return small
 
 
 def duration_of(path):
@@ -254,7 +281,7 @@ def main():
 
         if GEMINI_KEY:
             say(f"🧠 وجدت {len(cands)} لحظة، أتحقق أيها أهداف...")
-            for c in cands[:30]:
+            for c in cands[:(16 if TARGET_MIN <= 4 else 30)]:
                 try:
                     classify(src, c)
                 except Exception as e:  # noqa
@@ -267,21 +294,22 @@ def main():
             sys.exit(1)
         goals = sum(1 for c in chosen if c.get("event") == "goal")
 
-        say(f"🎬 أركّب الملخص: {len(chosen)} لقطة (أهداف مؤكدة: {goals}) بمدة تقارب {length / 60:.0f} دقيقة...")
-        final = build(src, chosen, total)
+        say(f"🎬 أركّب الملخص: {len(chosen)} لقطة (أهداف مؤكدة: {goals}) بمدة تقارب {length / 60:.1f} دقيقة...")
+        final = build(src, chosen, total, TARGET_MIN * 60)
 
-        mins = duration_of(final) / 60
+        dur = duration_of(final)
         size = final.stat().st_size / 1024 / 1024
         run_url = (f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/"
                    f"{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}")
-        if size <= 49:
-            with open(final, "rb") as f:
-                requests.post(f"{API}/sendVideo", data={"chat_id": CHAT, "supports_streaming": "true"},
-                              files={"video": f}, timeout=900)
-            say(f"✅ ملخص المباراة جاهز ({mins:.0f} دقيقة).")
-        else:
-            say(f"✅ الملخص جاهز ({mins:.0f} دقيقة، {size:.0f}MB) وهو أكبر من حد تلغرام (50MB).\n"
-                f"حمّله من قسم Artifacts في هذه الصفحة:\n{run_url}")
+        to_send, note = final, ""
+        if size > 49:
+            to_send = shrink_for_telegram(final, dur)
+            note = (f"\nهذه نسخة أخف لتلغرام. النسخة الأصلية بجودة أعلى ({size:.0f}MB) "
+                    f"في قسم Artifacts:\n{run_url}")
+        with open(to_send, "rb") as f:
+            requests.post(f"{API}/sendVideo", data={"chat_id": CHAT, "supports_streaming": "true"},
+                          files={"video": f}, timeout=900)
+        say(f"✅ ملخص المباراة جاهز ({dur / 60:.1f} دقيقة)." + note)
     except SystemExit:
         raise
     except Exception:

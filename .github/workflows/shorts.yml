@@ -8,6 +8,16 @@ on:
       url:
         description: "رابط يوتيوب (اختياري - بدل تلغرام)"
         required: false
+      mode:
+        description: "النوع"
+        type: choice
+        options:
+          - shorts
+          - football
+        default: shorts
+      minutes:
+        description: "مدة ملخص المباراة بالدقائق (لوضع football فقط)"
+        required: false
 
 concurrency:
   group: shorts
@@ -26,6 +36,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           INPUT_URL: ${{ github.event.inputs.url }}
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+          INPUT_MIN: ${{ github.event.inputs.minutes }}
         run: python3 src/poll.py
 
       - name: Setup Python
@@ -66,7 +78,7 @@ jobs:
           if [ -n "$YT_COOKIES" ]; then printf '%s' "$YT_COOKIES" > cookies.txt; fi
 
       - name: Make shorts
-        if: steps.poll.outputs.url != ''
+        if: steps.poll.outputs.url != '' && steps.poll.outputs.mode != 'football'
         env:
           VIDEO_URL: ${{ steps.poll.outputs.url }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -77,9 +89,18 @@ jobs:
           NUM_CLIPS: ${{ vars.NUM_CLIPS }}
           LANG_CODE: ${{ vars.LANG_CODE }}
           HOOK_MODE: ${{ vars.HOOK_MODE }}
-          MUSIC: ${{ vars.MUSIC }}
-          MUSIC_LEVEL: ${{ vars.MUSIC_LEVEL }}
+          TEXT_FIX: ${{ vars.TEXT_FIX }}
         run: python src/pipeline.py
+
+      - name: Make football summary
+        if: steps.poll.outputs.url != '' && steps.poll.outputs.mode == 'football'
+        env:
+          VIDEO_URL: ${{ steps.poll.outputs.url }}
+          TARGET_MIN: ${{ steps.poll.outputs.minutes }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python src/football.py
 
       - name: Save outputs
         if: always() && steps.poll.outputs.url != ''

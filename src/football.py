@@ -1,4 +1,4 @@
-"""وضع كرة القدم: يلخّص مباراة كاملة إلى أبرز اللقطات والأهداف بالترتيب. بدون أي نص أو موسيقى."""
+"""وضع كرة القدم: يلخّص مباراة كاملة أو فيديو ملخص إلى أبرز اللقطات والأهداف بالترتيب. بدون أي نص أو موسيقى."""
 import base64
 import json
 import os
@@ -82,7 +82,7 @@ def audio_db(src):
     return 20 * np.log10(rms)
 
 
-def find_candidates(db, max_n=40, min_gap=60):
+def find_candidates(db, max_n=40, min_gap=60, skip=45):
     """يلتقط اللحظات التي يرتفع فيها صوت الملعب بشكل مستمر (الأهداف تعطي أطول وأعلى زئير)."""
     n = len(db)
     win = 121
@@ -92,7 +92,7 @@ def find_candidates(db, max_n=40, min_gap=60):
     k = 10
     csum = np.concatenate([[0], np.cumsum(excess)])
     sustained = np.array([(csum[min(i + k, n)] - csum[i]) / max(min(i + k, n) - i, 1) for i in range(n)])
-    sustained[:45] = -99          # تجاهل بداية البث
+    sustained[:skip] = -99        # تجاهل بداية البث
     cands = []
     for _ in range(max_n):
         i = int(np.argmax(sustained))
@@ -134,7 +134,7 @@ def gemini_models():
     return _MODELS
 
 
-def gemini_generate(parts):
+def gemini_generate(parts, config=None):
     last = None
     for model in gemini_models():
         for attempt in range(2):
@@ -143,7 +143,8 @@ def gemini_generate(parts):
                     f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                     params={"key": GEMINI_KEY},
                     json={"contents": [{"parts": parts}],
-                          "generationConfig": {"responseMimeType": "application/json", "temperature": 0}},
+                          "generationConfig": {"responseMimeType": "application/json", "temperature": 0,
+                                               **(config or {})}},
                     timeout=300)
                 if r.status_code == 429 and attempt == 0:
                     time.sleep(25)
@@ -230,10 +231,9 @@ def clip_filter(d):
             f"pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,{fade}[v]")
 
 
-def build(src, chosen, total, target_s=720.0):
+def build_windows(src, windows):
     clips = []
-    for i, c in enumerate(chosen, 1):
-        a, b = clip_window(c, total, target_s)
+    for i, (a, b) in enumerate(windows, 1):
         d = b - a
         out = WORK / f"clip{i:02d}.mp4"
         af = f"aresample=48000,afade=t=in:st=0:d=0.3,afade=t=out:st={d - 0.3:.2f}:d=0.3"
@@ -248,6 +248,123 @@ def build(src, chosen, total, target_s=720.0):
     run_cmd(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy",
              "-movflags", "+faststart", final])
     return final
+
+
+def build(src, chosen, total, target_s=720.0):
+    return build_windows(src, [clip_window(c, total, target_s) for c in chosen])
+
+
+# ---------------------------------------------------------------- highlights video -> shorter summary (Gemini watches it)
+def to_sec(v):
+    if isinstance(v, (int, float)):
+        return float(v)
+    parts = [float(p) for p in str(v).strip().split(":")]
+    sec = 0.0
+    for p in parts:
+        sec = sec * 60 + p
+    return sec
+
+
+def make_proxy(src):
+    proxy = WORK / "proxy.mp4"
+    run_cmd(["ffmpeg", "-y", "-i", src, "-vf", "scale=-2:360,fps=2", "-c:v", "libx264", "-crf", "30",
+             "-preset", "veryfast", "-c:a", "aac", "-b:a", "48k", "-ac", "1", proxy])
+    return proxy
+
+
+def upload_to_gemini(path):
+    size = path.stat().st_size
+    r = requests.post("https://generativelanguage.googleapis.com/upload/v1beta/files",
+                      params={"key": GEMINI_KEY},
+                      headers={"X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start",
+                               "X-Goog-Upload-Header-Content-Length": str(size),
+                               "X-Goog-Upload-Header-Content-Type": "video/mp4",
+                               "Content-Type": "application/json"},
+                      json={"file": {"display_name": "match"}}, timeout=60)
+    r.raise_for_status()
+    url = r.headers["x-goog-upload-url"]
+    with open(path, "rb") as f:
+        r2 = requests.post(url, headers={"Content-Length": str(size), "X-Goog-Upload-Offset": "0",
+                                         "X-Goog-Upload-Command": "upload, finalize"},
+                           data=f, timeout=900)
+    r2.raise_for_status()
+    info = r2.json()["file"]
+    for _ in range(72):
+        if info.get("state") == "ACTIVE":
+            return info
+        if info.get("state") == "FAILED":
+            raise RuntimeError("Gemini could not process the video")
+        time.sleep(5)
+        info = requests.get(f"https://generativelanguage.googleapis.com/v1beta/{info['name']}",
+                            params={"key": GEMINI_KEY}, timeout=30).json()
+    raise RuntimeError("Gemini video processing timeout")
+
+
+SUMMARY_PROMPT = """You are a football (soccer) video editor. This video is a match highlights compilation of about {total_min:.0f} minutes. Make a SHORT summary of about {target} seconds with only the best moments.
+
+Pick, in this priority: all goals (include 4-6 seconds of the build-up before the ball goes in, and about 3 seconds of the celebration), then the best saves, big chances (post, bar, narrow misses), skills and dribbles, red cards.
+Rules:
+- If the same goal appears again as a replay, keep only the first live version (or the clearest angle), not both.
+- Skip: intro, logos, graphics, scoreboards-only shots, studio talk, adverts, crowd shots, slow replays of things already chosen.
+- Each segment is 5-25 seconds. Total of all segments about {target} seconds.
+- Use exact timestamps from the video, format MM:SS.
+- importance: 1-10 (goals 9-10).
+Return ONLY a JSON array in chronological order:
+[{{"start":"MM:SS","end":"MM:SS","type":"goal|save|chance|skill|card|other","importance":0}}]"""
+
+
+def summarize_with_gemini(src, total, target_s):
+    proxy = make_proxy(src)
+    info = upload_to_gemini(proxy)
+    prompt = SUMMARY_PROMPT.format(total_min=total / 60, target=int(target_s))
+    parts = [{"file_data": {"mime_type": "video/mp4", "file_uri": info["uri"]}}, {"text": prompt}]
+    try:
+        data = gemini_generate(parts, {"mediaResolution": "MEDIA_RESOLUTION_LOW"})
+    except Exception as e:  # noqa
+        print("retrying without mediaResolution:", e)
+        data = gemini_generate(parts)
+    try:
+        requests.delete(f"https://generativelanguage.googleapis.com/v1beta/{info['name']}",
+                        params={"key": GEMINI_KEY}, timeout=30)
+    except Exception:  # noqa
+        pass
+    return segments_from(data, total, target_s)
+
+
+def segments_from(data, total, target_s):
+    if isinstance(data, dict):
+        data = data.get("segments") or data.get("moments") or []
+    segs = []
+    for d in data:
+        try:
+            a, b = to_sec(d["start"]), to_sec(d["end"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        a, b = max(a, 0.0), min(b, total)
+        if b - a < 3:
+            continue
+        if b - a > 30:
+            b = a + 30
+        segs.append({"a": a, "b": b, "imp": float(d.get("importance") or 5), "type": d.get("type", "")})
+    chosen, length = [], 0.0
+    for sg in sorted(segs, key=lambda x: -x["imp"]):
+        if any(sg["a"] < o["b"] and sg["b"] > o["a"] for o in chosen):
+            continue
+        if length + (sg["b"] - sg["a"]) > target_s * 1.15 and chosen:
+            continue
+        chosen.append(sg)
+        length += sg["b"] - sg["a"]
+        if length >= target_s:
+            break
+    chosen.sort(key=lambda x: x["a"])
+    return [(sg["a"], sg["b"]) for sg in chosen]
+
+
+def audio_windows(src, total, target_s):
+    """بديل بدون ذكاء اصطناعي: أعلى اللحظات صوتاً في الفيديو."""
+    cands = find_candidates(audio_db(src), max_n=30, min_gap=20, skip=5)
+    chosen, _ = choose(cands, total, target_s)
+    return [clip_window(c, total, target_s) for c in chosen]
 
 
 def shrink_for_telegram(final, dur):
@@ -273,29 +390,47 @@ def main():
         src = download()
         total = duration_of(src)
 
-        say("🔊 تحليل صوت الملعب لاكتشاف اللحظات القوية...")
-        cands = find_candidates(audio_db(src))
-        if len(cands) < 2:
-            say("❌ لم أجد لحظات قوية واضحة. ربما الفيديو ملخص جاهز أو صوته ضعيف.")
-            sys.exit(1)
-
-        if GEMINI_KEY:
-            say(f"🧠 وجدت {len(cands)} لحظة، أتحقق أيها أهداف...")
-            for c in cands[:(16 if TARGET_MIN <= 4 else 30)]:
+        target_s = TARGET_MIN * 60
+        if total <= 30 * 60:
+            # فيديو ملخص جاهز: Gemini يشاهده ويختار أبرز اللقطات
+            windows = []
+            if GEMINI_KEY:
+                say("🧠 أشاهد الفيديو بالذكاء الاصطناعي لاختيار الأهداف وأبرز اللقطات (قد يأخذ دقائق)...")
                 try:
-                    classify(src, c)
+                    windows = summarize_with_gemini(src, total, target_s)
                 except Exception as e:  # noqa
-                    print("classify failed:", e)
-                time.sleep(6)   # حدود الطبقة المجانية
+                    print("Gemini summary failed:", e)
+                    say("⚠️ تعذّر تحليل الفيديو بالذكاء الاصطناعي، سأختار حسب ارتفاع الصوت.")
+            if not windows:
+                windows = audio_windows(src, total, target_s)
+            if not windows:
+                say("❌ لم أستطع اختيار لقطات مناسبة.")
+                sys.exit(1)
+            say(f"🎬 أركّب الملخص من {len(windows)} لقطة...")
+            final = build_windows(src, windows)
+        else:
+            say("🔊 تحليل صوت الملعب لاكتشاف اللحظات القوية...")
+            cands = find_candidates(audio_db(src))
+            if len(cands) < 2:
+                say("❌ لم أجد لحظات قوية واضحة. ربما الفيديو ملخص جاهز أو صوته ضعيف.")
+                sys.exit(1)
 
-        chosen, length = choose(cands, total, TARGET_MIN * 60)
-        if not chosen:
-            say("❌ لم أستطع اختيار لقطات مناسبة.")
-            sys.exit(1)
-        goals = sum(1 for c in chosen if c.get("event") == "goal")
+            if GEMINI_KEY:
+                say(f"🧠 وجدت {len(cands)} لحظة، أتحقق أيها أهداف...")
+                for c in cands[:(16 if TARGET_MIN <= 4 else 30)]:
+                    try:
+                        classify(src, c)
+                    except Exception as e:  # noqa
+                        print("classify failed:", e)
+                    time.sleep(6)   # حدود الطبقة المجانية
 
-        say(f"🎬 أركّب الملخص: {len(chosen)} لقطة (أهداف مؤكدة: {goals}) بمدة تقارب {length / 60:.1f} دقيقة...")
-        final = build(src, chosen, total, TARGET_MIN * 60)
+            chosen, length = choose(cands, total, target_s)
+            if not chosen:
+                say("❌ لم أستطع اختيار لقطات مناسبة.")
+                sys.exit(1)
+            goals = sum(1 for c in chosen if c.get("event") == "goal")
+            say(f"🎬 أركّب الملخص: {len(chosen)} لقطة (أهداف مؤكدة: {goals}) بمدة تقارب {length / 60:.1f} دقيقة...")
+            final = build(src, chosen, total, target_s)
 
         dur = duration_of(final)
         size = final.stat().st_size / 1024 / 1024

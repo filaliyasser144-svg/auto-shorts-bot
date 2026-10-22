@@ -29,7 +29,7 @@ N_CLIPS = int(os.environ.get("NUM_CLIPS") or "5")
 HOOK_MODE = (os.environ.get("HOOK_MODE") or "auto").lower()    # auto | always | never
 TEXT_FIX = (os.environ.get("TEXT_FIX") or "on").lower()        # on | off
 MIN_D, MAX_D = 25, 60
-GAP = 0.45  # أي صمت أطول من هذا (بالثواني) يُحذف
+GAP = 0.40  # أي صمت أطول من هذا (بالثواني) يُحذف
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 
@@ -173,35 +173,38 @@ def transcribe(src):
 
 
 # ---------------------------------------------------------------- Gemini
-_MODELS = []
+_NAMES = []
 
 
-def gemini_models():
+def gemini_models(pro=False):
     if GEMINI_MODEL:
         return [GEMINI_MODEL]
-    if _MODELS:
-        return _MODELS
-    names = []
-    try:
-        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
-                         params={"key": GEMINI_KEY, "pageSize": 200}, timeout=30)
-        r.raise_for_status()
-        names = [m["name"].split("/")[-1] for m in r.json().get("models", [])
-                 if "generateContent" in m.get("supportedGenerationMethods", [])]
-    except Exception as e:  # noqa
-        print("list models failed:", e)
+    if not _NAMES:
+        try:
+            r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                             params={"key": GEMINI_KEY, "pageSize": 200}, timeout=30)
+            r.raise_for_status()
+            _NAMES.extend(m["name"].split("/")[-1] for m in r.json().get("models", [])
+                          if "generateContent" in m.get("supportedGenerationMethods", []))
+        except Exception as e:  # noqa
+            print("list models failed:", e)
     bad = ("lite", "image", "tts", "live", "audio", "embed", "vision", "robotics",
            "computer", "exp", "customtools", "thinking")
-    flash = [n for n in names if "flash" in n and not any(x in n for x in bad)]
-    stable = sorted([n for n in flash if "preview" not in n], reverse=True)
-    prev = sorted([n for n in flash if "preview" in n], reverse=True)
-    _MODELS.extend((stable + prev)[:4] or ["gemini-2.5-flash"])
-    return _MODELS
+    ok = [n for n in _NAMES if not any(x in n for x in bad)]
+
+    def order(xs):
+        return (sorted([n for n in xs if "preview" not in n], reverse=True) +
+                sorted([n for n in xs if "preview" in n], reverse=True))
+
+    flash = order([n for n in ok if "flash" in n])[:3]
+    pros = order([n for n in ok if "-pro" in n])[:2] if pro else []
+    return pros + flash or ["gemini-2.5-flash"]
 
 
-def gemini_generate(parts, temperature=0.4):
+def gemini_generate(parts, temperature=0.4, pro=False):
     last = None
-    for model in gemini_models():
+    models = gemini_models(pro)
+    for mi, model in enumerate(models):
         for attempt in range(2):
             try:
                 r = requests.post(
@@ -212,7 +215,7 @@ def gemini_generate(parts, temperature=0.4):
                                                "temperature": temperature}},
                     timeout=300,
                 )
-                if r.status_code == 429 and attempt == 0:
+                if r.status_code == 429 and attempt == 0 and mi == len(models) - 1:
                     time.sleep(25)
                     continue
                 r.raise_for_status()
@@ -383,9 +386,12 @@ def align_words(ws, new_tokens):
 
 
 FIX_PROMPT = """Listen carefully to this audio and write EXACTLY what is spoken, word for word.
+The speakers use Arabic (any dialect, especially Algerian Darija and other Maghrebi dialects), English, and often mix in French or English words.
 Rules:
-- Keep the original language(s). Arabic: Arabic script, keep the speaker's own dialect wording (do not convert to formal Arabic, do not translate), no diacritics. English: normal spelling.
-- One or more people may speak. Write everything every speaker says, in order. Do not label speakers.
+- Arabic speech: write it in Arabic script exactly as pronounced, keeping the speakers' own dialect words. Algerian Darija stays Darija: do NOT convert it to Modern Standard Arabic, do NOT translate it, do NOT "correct" the grammar. No diacritics.
+- French or English words said inside the speech: write them in Latin letters, correctly spelled.
+- English speech: normal spelling.
+- Two or more people may speak. Write everything every speaker says, in order. Do not label speakers.
 - Do not summarize, do not skip, do not repeat, do not add words.
 - The draft below is an automatic transcript with MANY mistakes. Use it only as a hint for names and terms; trust the audio.
 Return ONLY JSON: {{"text": "the exact words spoken"}}
@@ -411,7 +417,7 @@ def fix_text(idx, clip, words, src):
         prompt = FIX_PROMPT.format(draft=" ".join(w["w"] for w in ws))
         res = gemini_generate([{"text": prompt},
                                {"inline_data": {"mime_type": "audio/mp3", "data": data}}],
-                              temperature=0)
+                              temperature=0, pro=True)
         text = res.get("text", "") if isinstance(res, dict) else ""
         toks = text.split()
         if not (0.5 * len(ws) <= len(toks) <= 1.8 * len(ws)):
@@ -425,42 +431,267 @@ def fix_text(idx, clip, words, src):
         return words
 
 
-# ---------------------------------------------------------------- face tracking
-class FaceTracker:
-    def __init__(self, src):
-        self.ok = False
-        try:
-            self.cap = cv2.VideoCapture(str(src))
-            self.det = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-            self.ok = not self.det.empty()
-        except Exception as e:  # noqa
-            print("face detection unavailable:", e)
+# ---------------------------------------------------------------- faces + who is speaking
+YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+DET_W = 800        # عرض الصورة المستخدمة للكشف (أسرع وكافٍ)
+MIN_TURN = 2.5     # أقل مدة لكلام شخص حتى تنتقل الكاميرا إليه (المقاطعات القصيرة لا تحرّك الكاميرا)
+SPLIT_MIN = 1.5    # لا نقسم اللقطة إلى جزأين أقصر من هذا
 
-    def center(self, t0, t1):
-        """(x, y, ارتفاع الوجه نسبةً للإطار) أو None."""
-        if not self.ok:
-            return None
-        xs, ys, hs = [], [], []
+
+class FaceFinder:
+    """يكشف الوجوه: YuNet (دقيق مع الزوايا والوجوه الصغيرة)، وإلا Haar."""
+
+    def __init__(self):
+        self.yunet = None
+        self.haar = []
+        print("cv2", getattr(cv2, "__version__", "?"), "| CascadeClassifier:", hasattr(cv2, "CascadeClassifier"),
+              "| FaceDetectorYN:", hasattr(cv2, "FaceDetectorYN"), flush=True)
         try:
-            for f in (0.15, 0.5, 0.85):
-                self.cap.set(cv2.CAP_PROP_POS_MSEC, (t0 + (t1 - t0) * f) * 1000)
-                ok, frame = self.cap.read()
-                if not ok:
-                    continue
-                g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                h, w = g.shape
-                faces = self.det.detectMultiScale(g, 1.2, 5, minSize=(w // 20, w // 20))
-                if len(faces):
-                    x, y, fw, fh = max(faces, key=lambda b: b[2] * b[3])
-                    xs.append((x + fw / 2) / w)
-                    ys.append((y + fh / 2) / h)
-                    hs.append(fh / h)
+            model = WORK / "yunet.onnx"
+            if not model.exists() or model.stat().st_size < 100_000:
+                r = requests.get(YUNET_URL, timeout=60)
+                r.raise_for_status()
+                model.write_bytes(r.content)
+            self.yunet = cv2.FaceDetectorYN.create(str(model), "", (DET_W, DET_W), 0.6, 0.3, 5000)
+            print("face detector: YuNet", flush=True)
         except Exception as e:  # noqa
-            print("face detection error:", e)
-            return None
-        if not xs:
-            return None
-        return float(np.median(xs)), float(np.median(ys)), float(np.median(hs))
+            print("YuNet unavailable:", e, flush=True)
+        if self.yunet is None:
+            try:
+                for name in ("haarcascade_frontalface_alt2.xml", "haarcascade_profileface.xml"):
+                    c = cv2.CascadeClassifier(cv2.data.haarcascades + name)
+                    if not c.empty():
+                        self.haar.append((name, c))
+                print("face detector: Haar x", len(self.haar), flush=True)
+            except Exception as e:  # noqa
+                print("Haar unavailable:", e, flush=True)
+
+    @property
+    def ok(self):
+        return self.yunet is not None or bool(self.haar)
+
+    def detect(self, img):
+        """وجوه الصورة: [(cx, cy, w, h, mouth_x, mouth_y)] بإحداثيات الصورة."""
+        h, w = img.shape[:2]
+        out = []
+        try:
+            if self.yunet is not None:
+                self.yunet.setInputSize((w, h))
+                _, faces = self.yunet.detect(img)
+                for f in (faces if faces is not None else []):
+                    x, y, fw, fh = [float(v) for v in f[:4]]
+                    mx, my = (float(f[10]) + float(f[12])) / 2, (float(f[11]) + float(f[13])) / 2
+                    out.append((x + fw / 2, y + fh / 2, fw, fh, mx, my))
+            elif self.haar:
+                g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                m = (max(w // 30, 24),) * 2
+                raw = []
+                for name, c in self.haar:
+                    raw += [tuple(b) for b in c.detectMultiScale(g, 1.1, 5, minSize=m)]
+                    if "profile" in name:
+                        raw += [(w - x - fw, y, fw, fh) for x, y, fw, fh in
+                                c.detectMultiScale(cv2.flip(g, 1), 1.1, 5, minSize=m)]
+                for x, y, fw, fh in sorted(raw, key=lambda b: -b[2]):
+                    cx, cy = x + fw / 2, y + fh / 2
+                    if all(abs(cx - o[0]) > 0.5 * max(fw, o[2]) or abs(cy - o[1]) > 0.5 * max(fh, o[3])
+                           for o in out):
+                        out.append((cx, cy, float(fw), float(fh), cx, y + 0.78 * fh))
+        except Exception as e:  # noqa
+            print("face detect error:", e, flush=True)
+        return out
+
+
+def sample_frames(cap, t0, t1, fps=8):
+    cap.set(cv2.CAP_PROP_POS_MSEC, t0 * 1000)
+    native = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    step = max(int(round(native / fps)), 1)
+    times, frames = [], []
+    for i in range(int((t1 - t0) * native)):
+        if not cap.grab():
+            break
+        if i % step == 0:
+            ok, fr = cap.retrieve()
+            if not ok:
+                break
+            hh, ww = fr.shape[:2]
+            if ww > DET_W:
+                fr = cv2.resize(fr, (DET_W, int(hh * DET_W / ww)))
+            times.append(t0 + i / native)
+            frames.append(fr)
+    return times, frames
+
+
+def merge_slots(det_lists):
+    """يحوّل وجوه عدة إطارات إلى 'خانات' ثابتة، خانة لكل شخص."""
+    slots = []
+    for faces in det_lists:
+        for f in faces:
+            for sl in slots:
+                if (abs(f[0] - sl["v"][0]) < 0.6 * max(f[2], sl["v"][2]) and
+                        abs(f[1] - sl["v"][1]) < 0.6 * max(f[3], sl["v"][3])):
+                    sl["v"] = [(a * sl["n"] + b) / (sl["n"] + 1) for a, b in zip(sl["v"], f)]
+                    sl["n"] += 1
+                    break
+            else:
+                slots.append({"v": list(f), "n": 1})
+    if not slots:
+        return []
+    need = 2 if len(det_lists) >= 3 else 1
+    keep = [sl for sl in slots if sl["n"] >= need] or [max(slots, key=lambda sl: sl["n"])]
+    big = max(sl["v"][2] for sl in keep)
+    keep = [sl for sl in keep if sl["v"][2] >= 0.35 * big]      # تجاهل الوجوه الصغيرة جداً في الخلفية
+    keep.sort(key=lambda sl: sl["v"][0])
+    return [sl["v"] for sl in keep][:4]
+
+
+def analyze_segment(sg, finder, cap):
+    """وجوه المقطع + حركة الفم لكل وجه، لمعرفة من يتكلم."""
+    times, frames = sample_frames(cap, sg["s"], sg["e"])
+    if len(frames) < 2:
+        return None
+    pick = sorted({0, len(frames) // 2, len(frames) - 1})
+    slots = merge_slots([finder.detect(frames[i]) for i in pick])
+    if not slots:
+        return None
+    hh, ww = frames[0].shape[:2]
+    grays = [cv2.GaussianBlur(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), (5, 5), 0).astype(np.float32) for f in frames]
+    energy = np.zeros((len(frames) - 1, len(slots)))
+    for k, v in enumerate(slots):
+        cx, cy, fw, fh, mx, my = v
+        x0, x1 = int(max(mx - 0.32 * fw, 0)), int(min(mx + 0.32 * fw, ww))
+        y0, y1 = int(max(my - 0.22 * fw, 0)), int(min(my + 0.22 * fw, hh))
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            continue
+        for j in range(len(frames) - 1):
+            energy[j, k] = float(np.abs(grays[j + 1][y0:y1, x0:x1] - grays[j][y0:y1, x0:x1]).mean())
+    norm = [(v[0] / ww, v[1] / hh, v[2] / ww, v[3] / hh) for v in slots]
+    return {"slots": [{"cx": a, "cy": b, "w": c, "h": d} for a, b, c, d in norm],
+            "times": times, "energy": energy}
+
+
+def same_layout(a, b):
+    if a is None or b is None or len(a["slots"]) != len(b["slots"]):
+        return False
+    return all(abs(x["cx"] - y["cx"]) < 0.08 for x, y in zip(a["slots"], b["slots"]))
+
+
+def fill_unknown(flat):
+    last = None
+    for iv in flat:
+        if iv[2] == -1 and last is not None:
+            iv[2] = last
+        elif iv[2] != -1:
+            last = iv[2]
+    nxt = None
+    for iv in reversed(flat):
+        if iv[2] == -1 and nxt is not None:
+            iv[2] = nxt
+        elif iv[2] != -1:
+            nxt = iv[2]
+    for iv in flat:
+        if iv[2] == -1:
+            iv[2] = 0
+
+
+def smooth_runs(flat, min_turn):
+    """كلام أقصر من min_turn لا يحرّك الكاميرا: يُدمج مع من قبله."""
+    while True:
+        runs = []
+        for idx, iv in enumerate(flat):
+            if runs and runs[-1][0] == iv[2]:
+                runs[-1][2] = idx
+                runs[-1][3] += iv[1] - iv[0]
+            else:
+                runs.append([iv[2], idx, idx, iv[1] - iv[0]])
+        short = [r for r in runs if r[3] < min_turn]
+        if len(runs) < 2 or not short:
+            return
+        r = min(short, key=lambda r: r[3])
+        ri = runs.index(r)
+        new = runs[ri - 1][0] if ri > 0 else runs[ri + 1][0]
+        for idx in range(r[1], r[2] + 1):
+            flat[idx][2] = new
+
+
+def decide(segs, infos):
+    """قرار الكاميرا لكل مقطع: [{'sg': مقطع (قد يُقسم), 'face': (x, y, ارتفاع الوجه) أو None}]."""
+    ivs = []
+    for sg, info in zip(segs, infos):
+        lst = []
+        if info is not None:
+            if len(info["slots"]) == 1:
+                lst = [[sg["s"], sg["e"], 0]]
+            else:
+                times, en = info["times"], info["energy"]
+                for j in range(len(times) - 1):
+                    order = np.argsort(en[j])[::-1]
+                    best, second = en[j][order[0]], en[j][order[1]]
+                    lab = int(order[0]) if (best > 1.0 and best > 1.2 * second) else -1
+                    lst.append([times[j], times[j + 1], lab])
+                if lst:
+                    lst[0][0], lst[-1][1] = sg["s"], sg["e"]
+        ivs.append(lst)
+
+    i = 0
+    while i < len(segs):          # مجموعات لقطات متتالية بنفس تكوين الكاميرا (شخصان أو أكثر)
+        if infos[i] is None or len(infos[i]["slots"]) < 2 or not ivs[i]:
+            i += 1
+            continue
+        j = i + 1
+        while j < len(segs) and same_layout(infos[i], infos[j]) and ivs[j]:
+            j += 1
+        flat = [iv for k in range(i, j) for iv in ivs[k]]
+        fill_unknown(flat)
+        smooth_runs(flat, MIN_TURN)
+        i = j
+
+    plan = []
+    for sg, info, lst in zip(segs, infos, ivs):
+        if info is None or not lst:
+            plan.append({"sg": sg, "face": None})
+            continue
+        runs = []
+        for iv in lst:
+            if runs and runs[-1][2] == iv[2]:
+                runs[-1][1] = iv[1]
+            else:
+                runs.append([iv[0], iv[1], iv[2]])
+        merged = True
+        while merged and len(runs) > 1:      # لا نقسم إلى أجزاء قصيرة جداً
+            merged = False
+            for ri, r in enumerate(runs):
+                if r[1] - r[0] < SPLIT_MIN:
+                    tgt = runs[ri - 1] if ri > 0 else runs[ri + 1]
+                    tgt[0], tgt[1] = min(tgt[0], r[0]), max(tgt[1], r[1])
+                    runs.pop(ri)
+                    merged = True
+                    break
+            for ri in range(len(runs) - 1):  # نفس الشخص متتالياً
+                if runs[ri][2] == runs[ri + 1][2]:
+                    runs[ri][1] = runs[ri + 1][1]
+                    runs.pop(ri + 1)
+                    merged = True
+                    break
+        for r in runs:
+            part = {"s": r[0], "e": r[1],
+                    "words": [w for w in sg["words"] if r[0] <= (w["s"] + w["e"]) / 2 < r[1]
+                              or (r is runs[-1] and (w["s"] + w["e"]) / 2 >= r[1])]}
+            if not part["words"]:
+                part["words"] = list(sg["words"]) if len(runs) == 1 else []
+            sl = info["slots"][min(r[2], len(info["slots"]) - 1)]
+            plan.append({"sg": part, "face": (sl["cx"], sl["cy"], sl["h"])})
+    return [p for p in plan if p["sg"]["words"]]
+
+
+def plan_crops(segs, finder, cap):
+    infos = []
+    for sg in segs:
+        try:
+            infos.append(analyze_segment(sg, finder, cap))
+        except Exception as e:  # noqa
+            print("segment analysis failed:", e, flush=True)
+            infos.append(None)
+    return decide(segs, infos)
 
 
 # ---------------------------------------------------------------- captions + hook
@@ -486,22 +717,6 @@ def wrap_hook(text, maxc, maxlines=2):
     return "\\N".join(esc(l) for l in lines[:maxlines])
 
 
-def chunks(ws, maxc=26):
-    out, cur, chars = [], [], 0
-    for w in ws:
-        if cur and chars + len(w["w"]) > maxc:
-            out.append(cur)
-            cur, chars = [], 0
-        cur.append(w)
-        chars += len(w["w"]) + 1
-        if len(cur) >= 3 or re.search(r"[.!?؟،,:;]$", w["w"]):
-            out.append(cur)
-            cur, chars = [], 0
-    if cur:
-        out.append(cur)
-    return out
-
-
 def is_latin(words):
     txt = "".join(w["w"] for w in words)
     ar = sum(1 for c in txt if "\u0600" <= c <= "\u06ff")
@@ -509,9 +724,67 @@ def is_latin(words):
     return la > ar
 
 
+def pick_fonts():
+    """أفضل خط عربي ولاتيني متوفر على السيرفر."""
+    try:
+        out = subprocess.run(["fc-list", ":", "family"], capture_output=True, text=True).stdout
+    except Exception:  # noqa
+        out = ""
+    fams = {f.strip().lower() for line in out.splitlines() for f in line.split(",")}
+
+    def first(cands, default):
+        for c in cands:
+            if c.lower() in fams:
+                return c
+        return default
+
+    ar = first(["Tajawal", "Vazirmatn", "IBM Plex Sans Arabic", "Cairo", "Noto Kufi Arabic",
+                "Noto Sans Arabic"], "Noto Sans Arabic")
+    la = first(["Poppins", "Montserrat", "Inter", "Noto Sans"], "Noto Sans")
+    print("fonts:", ar, "|", la, flush=True)
+    return ar, la
+
+
+FONT_AR, FONT_LATIN = pick_fonts()
+
+
+def phrases(ws, maxc):
+    """يجمع الكلمات في عبارات قصيرة (سطران كحد أقصى) تظهر دفعة واحدة."""
+    out, cur = [], []
+
+    def n_chars(c):
+        return sum(len(w["w"]) for w in c) + max(len(c) - 1, 0)
+
+    for w in ws:
+        if cur:
+            gap = w["nt"] - cur[-1]["ne"]
+            if (n_chars(cur) + 1 + len(w["w"]) > 2 * maxc or gap > 0.55 or len(cur) >= 7
+                    or re.search(r"[.!?؟,،;:]$", cur[-1]["w"])):
+                out.append(cur)
+                cur = []
+        cur.append(w)
+    if cur:
+        out.append(cur)
+    return out
+
+
+def two_lines(texts, maxc):
+    total = sum(len(t) for t in texts) + len(texts) - 1
+    if total <= maxc or len(texts) < 2:
+        return " ".join(texts)
+    best, best_i = None, 1
+    for i in range(1, len(texts)):
+        a = sum(len(t) for t in texts[:i]) + i - 1
+        b = sum(len(t) for t in texts[i:]) + len(texts) - i - 1
+        if best is None or max(a, b) < best:
+            best, best_i = max(a, b), i
+    return " ".join(texts[:best_i]) + "\\N" + " ".join(texts[best_i:])
+
+
 def ass_head(latin):
-    font = "Noto Sans" if latin else "Noto Sans Arabic"
-    cap_size = 88 if latin else 98
+    font = FONT_LATIN if latin else FONT_AR
+    size = 70 if latin else 80
+    spacing = 1 if latin else 0
     return f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {W}
@@ -520,8 +793,8 @@ WrapStyle: 0
 
 [V4+ Styles]
 Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
-Style: Cap,{font},{cap_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,9,3,2,50,50,540,1
-Style: Hook,{font},92,&H00101010,&H00101010,&H0000D7FF,&H96000000,-1,0,0,0,100,100,0,0,3,26,6,8,50,50,250,1
+Style: Cap,{font},{size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,{spacing},0,1,4,2,2,70,70,400,1
+Style: Hook,{font},{size + 4},&H00FFFFFF,&H00FFFFFF,&H4A000000,&H00000000,-1,0,0,0,100,100,{spacing},0,3,26,0,8,60,60,250,1
 Style: Bar,{font},40,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1
 
 [Events]
@@ -540,18 +813,18 @@ def build_ass(segs, hook, total, path):
     if latin:
         for x in ws:
             x["w"] = x["w"].upper()
+    maxc = 17 if latin else 20
     lines = [ass_head(latin)]
-    for ch in chunks(ws, 16 if latin else 26):
-        for i, w in enumerate(ch):
-            end = ch[i + 1]["nt"] if i + 1 < len(ch) else max(w["ne"], w["nt"] + 0.2)
-            parts = []
-            for k, x in enumerate(ch):
-                if k == i:
-                    parts.append("{\\c&H00FFFF&\\fscx112\\fscy112}" + esc(x["w"]) +
-                                 "{\\c&HFFFFFF&\\fscx100\\fscy100}")
-                else:
-                    parts.append(esc(x["w"]))
-            lines.append(f"Dialogue: 0,{ts(w['nt'])},{ts(end)},Cap,,0,0,0,,{' '.join(parts)}")
+    ps = phrases(ws, maxc)
+    for i, ph in enumerate(ps):
+        start = max(ph[0]["nt"] - 0.04, 0)
+        end = ph[-1]["ne"] + 0.18
+        if i + 1 < len(ps):
+            end = min(end, ps[i + 1][0]["nt"] - 0.02)
+        end = max(end, start + 0.3)
+        text = two_lines([esc(w["w"]) for w in ph], maxc)
+        lines.append(f"Dialogue: 0,{ts(start)},{ts(end)},Cap,,0,0,0,,"
+                     f"{{\\fad(70,50)\\fscx94\\fscy94\\t(0,110,\\fscx100\\fscy100)}}{text}")
 
     if hook:
         text = wrap_hook(hook.upper() if latin else hook, 20 if latin else 17)
@@ -561,8 +834,8 @@ def build_ass(segs, hook, total, path):
 
     ms = int(total * 1000)
     lines.append(f"Dialogue: 5,{ts(0)},{ts(total)},Bar,,0,0,0,,"
-                 f"{{\\an7\\pos(0,1890)\\fscx0\\t(0,{ms},\\fscx100)\\1c&H00D7FF&\\bord0\\shad0\\p1}}"
-                 f"m 0 0 l {W} 0 {W} 26 0 26{{\\p0}}")
+                 f"{{\\an7\\pos(0,1890)\\fscx0\\t(0,{ms},\\fscx100)\\1c&HFFFFFF&\\1a&H55&\\bord0\\shad0\\p1}}"
+                 f"m 0 0 l {W} 0 {W} 20 0 20{{\\p0}}")
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -593,7 +866,7 @@ def show_hook(clip):
     return hook if ctype in ("educational", "important") else ""
 
 
-def render(idx, clip, src, words, sw, sh, tracker):
+def render(idx, clip, src, words, sw, sh, finder, cap):
     start, end = clip["start"], clip["end"]
     cw_words = [w for w in words if w["s"] >= start - 0.05 and w["e"] <= end + 0.2]
     if not cw_words:
@@ -607,6 +880,15 @@ def render(idx, clip, src, words, sw, sh, tracker):
         if tw:
             segs_teaser = build_segments(tw, t0)
     segs = segs_teaser + segs_main
+
+    # الكاميرا الذكية: تتبع وجه المتحدث (شخصان أو أكثر) وتنتقل فقط عند كلام طويل
+    if finder.ok:
+        plan = plan_crops(segs, finder, cap)
+    else:
+        plan = [{"sg": sg, "face": None} for sg in segs]
+    if not plan:
+        plan = [{"sg": sg, "face": None} for sg in segs]
+    segs = [p["sg"] for p in plan]
     total = sum(sg["e"] - sg["s"] for sg in segs)
 
     if sw / sh >= 9 / 16:
@@ -619,12 +901,12 @@ def render(idx, clip, src, words, sw, sh, tracker):
     build_ass(segs, hook, total, ass)
 
     parts, prev = [], (0.5, 0.45, 0.0)
-    for i, sg in enumerate(segs):
-        found = tracker.center(sg["s"], sg["e"])
-        fx, fy, fh = found if found else prev
+    for i, p in enumerate(plan):
+        sg = p["sg"]
+        fx, fy, fh = p["face"] or prev
         prev = (fx, fy, fh)
-        # تكبير خفيف فقط في اللقطات الواسعة؛ لا تكبير في اللقطات القريبة أو إذا لم نعرف مكان الوجه
-        f = 0.85 if (found and i % 2 == 1 and fh < 0.22) else 1.0
+        # تقريب خفيف إذا كان الوجه صغيراً (لقطة واسعة)، بدون تكبير مبالغ فيه
+        f = min(1.0, max(0.75, fh / 0.16)) if fh > 0 else 1.0
         ch_, cw_ = int(base_h * f) // 2 * 2, int(base_w * f) // 2 * 2
         x = int(min(max(fx * sw - cw_ / 2, 0), sw - cw_)) // 2 * 2
         y = int(min(max(fy * sh - 0.38 * ch_, 0), sh - ch_)) // 2 * 2
@@ -632,9 +914,11 @@ def render(idx, clip, src, words, sw, sh, tracker):
         parts.append(f"[0:v]trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS,"
                      f"crop={cw_}:{ch_}:{x}:{y},scale={W}:{H}:flags=lanczos,setsar=1,fps=30[v{i}]")
         parts.append(f"[0:a]atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS,aresample=48000[a{i}]")
-    n = len(segs)
+    n = len(plan)
     parts.append("".join(f"[v{i}][a{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=1[vc][ac]")
-    parts.append(f"[vc]ass=filename={ass}[vo]")
+    fontsdir = os.path.expanduser("~/.fonts")
+    fd = f":fontsdir={fontsdir}" if os.path.isdir(fontsdir) else ""
+    parts.append(f"[vc]ass=filename={ass}{fd}[vo]")
     parts.append("[ac]highpass=f=70,loudnorm=I=-16:TP=-1.5:LRA=11[ao]")
 
     script = WORK / f"c{idx}.txt"
@@ -670,11 +954,12 @@ def main():
             say("❌ لم أستطع اختيار مقاطع مناسبة.")
             sys.exit(1)
 
-        tracker = FaceTracker(src)
+        finder = FaceFinder()
+        cap = cv2.VideoCapture(str(src))
         for i, clip in enumerate(clips, 1):
             say(f"🎬 مونتاج المقطع {i}/{len(clips)}...")
             clip_words = fix_text(i, clip, words, src)
-            out = render(i, clip, src, clip_words, sw, sh_, tracker)
+            out = render(i, clip, src, clip_words, sw, sh_, finder, cap)
             if out:
                 send_video(out, clip.get("title") or clip.get("hook") or f"Short {i}")
         say("✅ انتهى! هذه شورتاتك.")

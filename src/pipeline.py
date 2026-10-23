@@ -29,7 +29,6 @@ N_CLIPS = int(os.environ.get("NUM_CLIPS") or "5")
 HOOK_MODE = (os.environ.get("HOOK_MODE") or "auto").lower()    # auto | always | never
 TEXT_FIX = (os.environ.get("TEXT_FIX") or "on").lower()        # on | off
 MIN_D, MAX_D = 25, 60
-GAP = 0.40  # أي صمت أطول من هذا (بالثواني) يُحذف
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 
@@ -280,14 +279,6 @@ def gemini_pick(sentences):
                      "content_type": str(c.get("content_type") or "").lower(),
                      "hook": c.get("hook") or "", "title": c.get("title") or "",
                      "score": c.get("score", 50)}, sentences)
-        try:
-            ts_, te_ = c.get("teaser_start"), c.get("teaser_end")
-            if ts_ is not None and te_ is not None:
-                ts_, te_ = float(ts_), float(te_)
-                if clip["start"] + 6 <= ts_ and te_ <= clip["end"] and 2.5 <= te_ - ts_ <= 10:
-                    clip["teaser"] = (ts_, te_)
-        except (TypeError, ValueError):
-            pass
         out.append(clip)
     return out
 
@@ -431,11 +422,9 @@ def fix_text(idx, clip, words, src):
         return words
 
 
-# ---------------------------------------------------------------- faces + who is speaking
+# ---------------------------------------------------------------- faces + camera shots + layouts
 YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 DET_W = 800        # عرض الصورة المستخدمة للكشف (أسرع وكافٍ)
-MIN_TURN = 2.5     # أقل مدة لكلام شخص حتى تنتقل الكاميرا إليه (المقاطعات القصيرة لا تحرّك الكاميرا)
-SPLIT_MIN = 1.5    # لا نقسم اللقطة إلى جزأين أقصر من هذا
 
 
 class FaceFinder:
@@ -501,26 +490,6 @@ class FaceFinder:
         return out
 
 
-def sample_frames(cap, t0, t1, fps=8):
-    cap.set(cv2.CAP_PROP_POS_MSEC, t0 * 1000)
-    native = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    step = max(int(round(native / fps)), 1)
-    times, frames = [], []
-    for i in range(int((t1 - t0) * native)):
-        if not cap.grab():
-            break
-        if i % step == 0:
-            ok, fr = cap.retrieve()
-            if not ok:
-                break
-            hh, ww = fr.shape[:2]
-            if ww > DET_W:
-                fr = cv2.resize(fr, (DET_W, int(hh * DET_W / ww)))
-            times.append(t0 + i / native)
-            frames.append(fr)
-    return times, frames
-
-
 def merge_slots(det_lists):
     """يحوّل وجوه عدة إطارات إلى 'خانات' ثابتة، خانة لكل شخص."""
     slots = []
@@ -544,154 +513,124 @@ def merge_slots(det_lists):
     return [sl["v"] for sl in keep][:4]
 
 
-def analyze_segment(sg, finder, cap):
-    """وجوه المقطع + حركة الفم لكل وجه، لمعرفة من يتكلم."""
-    times, frames = sample_frames(cap, sg["s"], sg["e"])
-    if len(frames) < 2:
+PW, PH, BAND = 1080, 850, 220      # الشاشة المقسومة: لوحة علوية 850 + شريط النص 220 + لوحة سفلية 850 = 1920
+_FACE_CALLS = [0]
+
+FACES_PROMPT = """Detect every human face visible in this image (front, side or partly turned, small or large).
+Return ONLY JSON: {"faces": [{"box_2d": [ymin, xmin, ymax, xmax]}]} with coordinates normalized to 0-1000."""
+
+
+def gemini_faces(frame):
+    """بديل: Gemini يحدد أماكن الوجوه إذا فشل الكاشف المحلي (حد أقصى 8 طلبات لكل تشغيل)."""
+    if not GEMINI_KEY or _FACE_CALLS[0] >= 8:
+        return []
+    _FACE_CALLS[0] += 1
+    try:
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        data = base64.b64encode(buf.tobytes()).decode()
+        res = gemini_generate([{"text": FACES_PROMPT},
+                               {"inline_data": {"mime_type": "image/jpeg", "data": data}}], temperature=0)
+        out = []
+        for f in res.get("faces", []):
+            y0, x0, y1, x1 = [float(v) / 1000 for v in f["box_2d"]]
+            out.append(((x0 + x1) / 2, (y0 + y1) / 2, x1 - x0, y1 - y0))
+        return out
+    except Exception as e:  # noqa
+        print("gemini faces failed:", e, flush=True)
+        return []
+
+
+def detect_cuts(src, start, dur, thr=0.15):
+    """أزمنة تبديل الكاميرا (بدقة الإطار) داخل المقطع، نسبةً لبدايته."""
+    try:
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-ss", f"{start:.3f}", "-t", f"{dur:.3f}", "-i", str(src),
+                            "-vf", f"scale=320:-2,select='gt(scene,{thr})',showinfo", "-an", "-f", "null", "-"],
+                           capture_output=True, text=True)
+        cuts = sorted(float(m.group(1)) for m in re.finditer(r"pts_time:([0-9.]+)", r.stderr))
+    except Exception as e:  # noqa
+        print("cut detection failed:", e, flush=True)
+        return []
+    out = []
+    for c in cuts:
+        if 0.15 < c < dur - 0.15 and (not out or c - out[-1] > 0.3):
+            out.append(c)
+    return out
+
+
+def read_frame(cap, t):
+    cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+    ok, fr = cap.read()
+    if not ok:
         return None
-    pick = sorted({0, len(frames) // 2, len(frames) - 1})
-    slots = merge_slots([finder.detect(frames[i]) for i in pick])
-    if not slots:
-        return None
+    h, w = fr.shape[:2]
+    if w > DET_W:
+        fr = cv2.resize(fr, (DET_W, int(h * DET_W / w)))
+    return fr
+
+
+def shot_faces(cap, finder, t0, t1):
+    """وجوه لقطة كاملة (إحداثيات نسبية 0-1): (cx, cy, w, h)."""
+    d = t1 - t0
+    if d > 0.6:
+        times = sorted({min(max(t0 + d * f, t0 + 0.15), t1 - 0.1) for f in (0.2, 0.5, 0.8)})
+    else:
+        times = [(t0 + t1) / 2]
+    frames = [f for f in (read_frame(cap, t) for t in times) if f is not None]
+    if not frames:
+        return []
     hh, ww = frames[0].shape[:2]
-    grays = [cv2.GaussianBlur(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), (5, 5), 0).astype(np.float32) for f in frames]
-    energy = np.zeros((len(frames) - 1, len(slots)))
-    for k, v in enumerate(slots):
-        cx, cy, fw, fh, mx, my = v
-        x0, x1 = int(max(mx - 0.32 * fw, 0)), int(min(mx + 0.32 * fw, ww))
-        y0, y1 = int(max(my - 0.22 * fw, 0)), int(min(my + 0.22 * fw, hh))
-        if x1 - x0 < 4 or y1 - y0 < 4:
-            continue
-        for j in range(len(frames) - 1):
-            energy[j, k] = float(np.abs(grays[j + 1][y0:y1, x0:x1] - grays[j][y0:y1, x0:x1]).mean())
-    norm = [(v[0] / ww, v[1] / hh, v[2] / ww, v[3] / hh) for v in slots]
-    return {"slots": [{"cx": a, "cy": b, "w": c, "h": d} for a, b, c, d in norm],
-            "times": times, "energy": energy}
+    dets = [finder.detect(f) for f in frames] if finder.ok else [[] for _ in frames]
+    faces = [(v[0] / ww, v[1] / hh, v[2] / ww, v[3] / hh) for v in merge_slots(dets)]
+    if not faces:
+        faces = gemini_faces(frames[len(frames) // 2])
+    return faces
+
+
+def classify_layout(faces, sw, sh):
+    """single = وجه واحد (أو شخصان قريبان يكفيهما إطار عمودي)، stack = شخصان متباعدان: واحد فوق وواحد تحت."""
+    if not faces:
+        return {"kind": "single", "face": None}
+    faces = sorted(faces, key=lambda f: -f[2] * f[3])[:2]
+    big = max(f[2] * f[3] for f in faces)
+    faces = sorted([f for f in faces if f[2] * f[3] >= 0.25 * big], key=lambda f: f[0])
+    if len(faces) == 1:
+        return {"kind": "single", "face": faces[0]}
+    crop_w = min(sh * 9 / 16, sw) / sw
+    left, right = faces[0][0] - faces[0][2] / 2, faces[1][0] + faces[1][2] / 2
+    if (right - left) * 1.3 <= crop_w:
+        return {"kind": "single", "face": ((left + right) / 2, (faces[0][1] + faces[1][1]) / 2,
+                                             max(f[2] for f in faces), max(f[3] for f in faces))}
+    return {"kind": "stack", "faces": faces}
 
 
 def same_layout(a, b):
-    if a is None or b is None or len(a["slots"]) != len(b["slots"]):
+    if a["kind"] != b["kind"]:
         return False
-    return all(abs(x["cx"] - y["cx"]) < 0.08 for x, y in zip(a["slots"], b["slots"]))
+    if a["kind"] == "stack":
+        return all(abs(x[0] - y[0]) < 0.05 for x, y in zip(a["faces"], b["faces"]))
+    if a["face"] is None or b["face"] is None:
+        return a["face"] is b["face"]
+    return abs(a["face"][0] - b["face"][0]) < 0.05
 
 
-def fill_unknown(flat):
-    last = None
-    for iv in flat:
-        if iv[2] == -1 and last is not None:
-            iv[2] = last
-        elif iv[2] != -1:
-            last = iv[2]
-    nxt = None
-    for iv in reversed(flat):
-        if iv[2] == -1 and nxt is not None:
-            iv[2] = nxt
-        elif iv[2] != -1:
-            nxt = iv[2]
-    for iv in flat:
-        if iv[2] == -1:
-            iv[2] = 0
-
-
-def smooth_runs(flat, min_turn):
-    """كلام أقصر من min_turn لا يحرّك الكاميرا: يُدمج مع من قبله."""
-    while True:
-        runs = []
-        for idx, iv in enumerate(flat):
-            if runs and runs[-1][0] == iv[2]:
-                runs[-1][2] = idx
-                runs[-1][3] += iv[1] - iv[0]
-            else:
-                runs.append([iv[2], idx, idx, iv[1] - iv[0]])
-        short = [r for r in runs if r[3] < min_turn]
-        if len(runs) < 2 or not short:
-            return
-        r = min(short, key=lambda r: r[3])
-        ri = runs.index(r)
-        new = runs[ri - 1][0] if ri > 0 else runs[ri + 1][0]
-        for idx in range(r[1], r[2] + 1):
-            flat[idx][2] = new
-
-
-def decide(segs, infos):
-    """قرار الكاميرا لكل مقطع: [{'sg': مقطع (قد يُقسم), 'face': (x, y, ارتفاع الوجه) أو None}]."""
-    ivs = []
-    for sg, info in zip(segs, infos):
-        lst = []
-        if info is not None:
-            if len(info["slots"]) == 1:
-                lst = [[sg["s"], sg["e"], 0]]
-            else:
-                times, en = info["times"], info["energy"]
-                for j in range(len(times) - 1):
-                    order = np.argsort(en[j])[::-1]
-                    best, second = en[j][order[0]], en[j][order[1]]
-                    lab = int(order[0]) if (best > 1.0 and best > 1.2 * second) else -1
-                    lst.append([times[j], times[j + 1], lab])
-                if lst:
-                    lst[0][0], lst[-1][1] = sg["s"], sg["e"]
-        ivs.append(lst)
-
-    i = 0
-    while i < len(segs):          # مجموعات لقطات متتالية بنفس تكوين الكاميرا (شخصان أو أكثر)
-        if infos[i] is None or len(infos[i]["slots"]) < 2 or not ivs[i]:
-            i += 1
+def plan_layouts(src, start, end, finder, cap, sw, sh):
+    """يقسّم المقطع عند كل تبديل كاميرا، ويحدد لكل لقطة: شاشة كاملة أو تقسيم."""
+    cuts = detect_cuts(src, start, end - start)
+    bounds = [0.0] + cuts + [end - start]
+    parts = []
+    for a, b in zip(bounds, bounds[1:]):
+        if b - a < 0.05:
             continue
-        j = i + 1
-        while j < len(segs) and same_layout(infos[i], infos[j]) and ivs[j]:
-            j += 1
-        flat = [iv for k in range(i, j) for iv in ivs[k]]
-        fill_unknown(flat)
-        smooth_runs(flat, MIN_TURN)
-        i = j
-
-    plan = []
-    for sg, info, lst in zip(segs, infos, ivs):
-        if info is None or not lst:
-            plan.append({"sg": sg, "face": None})
-            continue
-        runs = []
-        for iv in lst:
-            if runs and runs[-1][2] == iv[2]:
-                runs[-1][1] = iv[1]
-            else:
-                runs.append([iv[0], iv[1], iv[2]])
-        merged = True
-        while merged and len(runs) > 1:      # لا نقسم إلى أجزاء قصيرة جداً
-            merged = False
-            for ri, r in enumerate(runs):
-                if r[1] - r[0] < SPLIT_MIN:
-                    tgt = runs[ri - 1] if ri > 0 else runs[ri + 1]
-                    tgt[0], tgt[1] = min(tgt[0], r[0]), max(tgt[1], r[1])
-                    runs.pop(ri)
-                    merged = True
-                    break
-            for ri in range(len(runs) - 1):  # نفس الشخص متتالياً
-                if runs[ri][2] == runs[ri + 1][2]:
-                    runs[ri][1] = runs[ri + 1][1]
-                    runs.pop(ri + 1)
-                    merged = True
-                    break
-        for r in runs:
-            part = {"s": r[0], "e": r[1],
-                    "words": [w for w in sg["words"] if r[0] <= (w["s"] + w["e"]) / 2 < r[1]
-                              or (r is runs[-1] and (w["s"] + w["e"]) / 2 >= r[1])]}
-            if not part["words"]:
-                part["words"] = list(sg["words"]) if len(runs) == 1 else []
-            sl = info["slots"][min(r[2], len(info["slots"]) - 1)]
-            plan.append({"sg": part, "face": (sl["cx"], sl["cy"], sl["h"])})
-    return [p for p in plan if p["sg"]["words"]]
-
-
-def plan_crops(segs, finder, cap):
-    infos = []
-    for sg in segs:
-        try:
-            infos.append(analyze_segment(sg, finder, cap))
-        except Exception as e:  # noqa
-            print("segment analysis failed:", e, flush=True)
-            infos.append(None)
-    return decide(segs, infos)
+        lay = classify_layout(shot_faces(cap, finder, start + a, start + b), sw, sh)
+        lay["t0"], lay["t1"] = a, b
+        parts.append(lay)
+    merged = []
+    for p in parts:
+        if merged and same_layout(merged[-1], p):
+            merged[-1]["t1"] = p["t1"]
+        else:
+            merged.append(p)
+    return merged or [{"kind": "single", "face": None, "t0": 0.0, "t1": end - start}]
 
 
 # ---------------------------------------------------------------- captions + hook
@@ -802,20 +741,23 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 """
 
 
-def build_ass(segs, hook, total, path):
+def build_ass(segs, hook, total, path, layouts=None):
     ws, off = [], 0.0
     for sg in segs:
         for w in sg["words"]:
             ws.append({"w": w["w"], "nt": off + (w["s"] - sg["s"]), "ne": off + (w["e"] - sg["s"])})
         off += sg["e"] - sg["s"]
 
+    layouts = layouts or [{"kind": "single", "t0": 0.0, "t1": total}]
     latin = is_latin(ws)
     if latin:
         for x in ws:
             x["w"] = x["w"].upper()
+    size = 70 if latin else 80
     maxc = 17 if latin else 20
     lines = [ass_head(latin)]
     ps = phrases(ws, maxc)
+    base_tags = "\\fad(70,50)\\fscx94\\fscy94\\t(0,110,\\fscx100\\fscy100)"
     for i, ph in enumerate(ps):
         start = max(ph[0]["nt"] - 0.04, 0)
         end = ph[-1]["ne"] + 0.18
@@ -823,13 +765,21 @@ def build_ass(segs, hook, total, path):
             end = min(end, ps[i + 1][0]["nt"] - 0.02)
         end = max(end, start + 0.3)
         text = two_lines([esc(w["w"]) for w in ph], maxc)
-        lines.append(f"Dialogue: 0,{ts(start)},{ts(end)},Cap,,0,0,0,,"
-                     f"{{\\fad(70,50)\\fscx94\\fscy94\\t(0,110,\\fscx100\\fscy100)}}{text}")
+        for lay in layouts:                 # النص يتبع الشاشة: في الوسط بين الشخصين عند التقسيم
+            s2, e2 = max(start, lay["t0"]), min(end, lay["t1"])
+            if e2 - s2 < 0.08:
+                continue
+            tags = base_tags
+            if lay["kind"] == "stack":
+                tags = f"\\an5\\pos(540,960)\\fs{int(size * 0.84)}" + base_tags
+            lines.append(f"Dialogue: 0,{ts(s2)},{ts(e2)},Cap,,0,0,0,,{{{tags}}}{text}")
 
     if hook:
+        first = layouts[0]["kind"] if layouts else "single"
+        pos = f"\\an8\\pos(540,40)\\fs{int(size * 0.8)}" if first == "stack" else ""
         text = wrap_hook(hook.upper() if latin else hook, 20 if latin else 17)
         lines.append(f"Dialogue: 2,{ts(0.1)},{ts(min(3.8, total))},Hook,,0,0,0,,"
-                     f"{{\\fad(90,260)\\fscx55\\fscy55\\t(0,150,\\fscx110\\fscy110)"
+                     f"{{{pos}\\fad(90,260)\\fscx55\\fscy55\\t(0,150,\\fscx110\\fscy110)"
                      f"\\t(150,270,\\fscx100\\fscy100)}}{text}")
 
     ms = int(total * 1000)
@@ -840,22 +790,6 @@ def build_ass(segs, hook, total, path):
 
 
 # ---------------------------------------------------------------- render
-def build_segments(cw, start):
-    segs = []
-    for w in cw:
-        if segs and w["s"] - segs[-1]["last_e"] <= GAP:
-            segs[-1]["words"].append(w)
-            segs[-1]["last_e"] = w["e"]
-        else:
-            segs.append({"words": [w], "last_e": w["e"]})
-    prev_end = start
-    for sg in segs:
-        sg["s"] = max(prev_end, sg["words"][0]["s"] - 0.10)
-        sg["e"] = sg["last_e"] + 0.15
-        prev_end = sg["e"]
-    return segs
-
-
 def show_hook(clip):
     hook = (clip.get("hook") or "").strip()
     ctype = clip.get("content_type", "")
@@ -866,69 +800,86 @@ def show_hook(clip):
     return hook if ctype in ("educational", "important") else ""
 
 
-def render(idx, clip, src, words, sw, sh, finder, cap):
-    start, end = clip["start"], clip["end"]
-    cw_words = [w for w in words if w["s"] >= start - 0.05 and w["e"] <= end + 0.2]
-    if not cw_words:
-        return None
-    segs_main = build_segments(cw_words, start)
+def panel_crop(face, sw, sh):
+    """قصّة لوحة (1080x850) حول وجه شخص في اللقطة الواسعة، بتقريب معقول."""
+    cx, cy, fw, fh = face
+    ch = min(max(fh * sh / 0.30, PH / 1.8), sh)
+    cw = ch * PW / PH
+    if cw > sw:
+        cw = sw
+        ch = cw * PH / PW
+    x = int(min(max(cx * sw - cw / 2, 0), sw - cw)) // 2 * 2
+    y = int(min(max(cy * sh - 0.42 * ch, 0), sh - ch)) // 2 * 2
+    return int(cw) // 2 * 2, int(ch) // 2 * 2, x, y
 
-    segs_teaser = []
-    if clip.get("teaser"):
-        t0, t1 = clip["teaser"]
-        tw = [w for w in words if w["s"] >= t0 - 0.05 and w["e"] <= t1 + 0.2]
-        if tw:
-            segs_teaser = build_segments(tw, t0)
-    segs = segs_teaser + segs_main
 
-    # الكاميرا الذكية: تتبع وجه المتحدث (شخصان أو أكثر) وتنتقل فقط عند كلام طويل
-    if finder.ok:
-        plan = plan_crops(segs, finder, cap)
-    else:
-        plan = [{"sg": sg, "face": None} for sg in segs]
-    if not plan:
-        plan = [{"sg": sg, "face": None} for sg in segs]
-    segs = [p["sg"] for p in plan]
-    total = sum(sg["e"] - sg["s"] for sg in segs)
-
+def single_crop(face, sw, sh):
     if sw / sh >= 9 / 16:
         base_h, base_w = sh, sh * 9 / 16
     else:
         base_w, base_h = sw, sw * 16 / 9
+    fx, fy, fw, fh = face if face else (0.5, 0.45, 0.0, 0.0)
+    f = min(1.0, max(0.75, fh / 0.16)) if fh > 0 else 1.0     # تقريب خفيف إذا كان الوجه صغيراً
+    ch_, cw_ = int(base_h * f) // 2 * 2, int(base_w * f) // 2 * 2
+    x = int(min(max(fx * sw - cw_ / 2, 0), sw - cw_)) // 2 * 2
+    y = int(min(max(fy * sh - 0.38 * ch_, 0), sh - ch_)) // 2 * 2
+    return cw_, ch_, x, y
+
+
+def render(idx, clip, src, words, sw, sh, finder, cap):
+    start, end = clip["start"], clip["end"]
+    dur = end - start
+    cw_words = [w for w in words if w["s"] >= start - 0.05 and w["e"] <= end + 0.2]
+    if not cw_words:
+        return None
+
+    # الفيديو يبقى متصلاً (بدون حذف صمت أو قص). الكاميرا والتقسيم يتبعان تبديل المصوّر الأصلي
+    layouts = plan_layouts(src, start, end, finder, cap, sw, sh)
+    print("layouts:", [(round(l["t0"], 1), round(l["t1"], 1), l["kind"]) for l in layouts], flush=True)
 
     hook = show_hook(clip)
     ass = WORK / f"c{idx}.ass"
-    build_ass(segs, hook, total, ass)
+    build_ass([{"s": start, "e": end, "words": cw_words}], hook, dur, ass, layouts)
 
-    parts, prev = [], (0.5, 0.45, 0.0)
-    for i, p in enumerate(plan):
-        sg = p["sg"]
-        fx, fy, fh = p["face"] or prev
-        prev = (fx, fy, fh)
-        # تقريب خفيف إذا كان الوجه صغيراً (لقطة واسعة)، بدون تكبير مبالغ فيه
-        f = min(1.0, max(0.75, fh / 0.16)) if fh > 0 else 1.0
-        ch_, cw_ = int(base_h * f) // 2 * 2, int(base_w * f) // 2 * 2
-        x = int(min(max(fx * sw - cw_ / 2, 0), sw - cw_)) // 2 * 2
-        y = int(min(max(fy * sh - 0.38 * ch_, 0), sh - ch_)) // 2 * 2
-        a, b = sg["s"] - start, sg["e"] - start
-        parts.append(f"[0:v]trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS,"
-                     f"crop={cw_}:{ch_}:{x}:{y},scale={W}:{H}:flags=lanczos,setsar=1,fps=30[v{i}]")
-        parts.append(f"[0:a]atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS,aresample=48000[a{i}]")
-    n = len(plan)
-    parts.append("".join(f"[v{i}][a{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=1[vc][ac]")
+    # حدود اللقطات بالإطارات (30 إطار/ثانية) حتى لا يضيع أي إطار ويبقى الصوت متزامناً تماماً
+    nf = max(int(round(dur * 30)), 1)
+    edges = [0]
+    for lay in layouts[:-1]:
+        edges.append(min(max(int(round(lay["t1"] * 30)), edges[-1] + 1), nf - 1))
+    edges.append(nf)
+    n = len(layouts)
+    parts = ["[0:v]fps=30" + (f",split={n}" + "".join(f"[vs{i}]" for i in range(n)) if n > 1 else "[vs0]")]
+    for i, lay in enumerate(layouts):
+        fa, fb = edges[i], edges[i + 1]
+        head = f"[vs{i}]trim=start_frame={fa}:end_frame={fb},setpts=PTS-STARTPTS"
+        d_i = (fb - fa) / 30
+        if lay["kind"] == "stack":
+            parts.append(f"{head},split=2[sa{i}][sb{i}]")
+            for tag, face in zip(("a", "b"), lay["faces"]):
+                cw_, ch_, x, y = panel_crop(face, sw, sh)
+                parts.append(f"[s{tag}{i}]crop={cw_}:{ch_}:{x}:{y},scale={PW}:{PH}:flags=lanczos,"
+                             f"setsar=1,format=yuv420p[t{tag}{i}]")
+            parts.append(f"color=c=0x0e0e0e:s={PW}x{BAND}:r=30:d={d_i + 1:.3f},format=yuv420p,setsar=1[bd{i}]")
+            parts.append(f"[ta{i}][bd{i}][tb{i}]vstack=inputs=3,trim=end_frame={fb - fa},"
+                         f"setpts=PTS-STARTPTS,fps=30[v{i}]")
+        else:
+            cw_, ch_, x, y = single_crop(lay["face"], sw, sh)
+            parts.append(f"{head},crop={cw_}:{ch_}:{x}:{y},scale={W}:{H}:flags=lanczos,"
+                         f"setsar=1,format=yuv420p,fps=30[v{i}]")
+    parts.append("".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[vc]")
     fontsdir = os.path.expanduser("~/.fonts")
     fd = f":fontsdir={fontsdir}" if os.path.isdir(fontsdir) else ""
     parts.append(f"[vc]ass=filename={ass}{fd}[vo]")
-    parts.append("[ac]highpass=f=70,loudnorm=I=-16:TP=-1.5:LRA=11[ao]")
+    parts.append("[0:a]aresample=48000,highpass=f=70,loudnorm=I=-16:TP=-1.5:LRA=11[ao]")
 
     script = WORK / f"c{idx}.txt"
     script.write_text(";\n".join(parts), encoding="utf-8")
 
     out = OUT / f"short_{idx}.mp4"
-    run_cmd(["ffmpeg", "-y", "-ss", f"{start:.3f}", "-t", f"{end - start + 1:.3f}", "-i", WORK / "src.mp4",
+    run_cmd(["ffmpeg", "-y", "-ss", f"{start:.3f}", "-t", f"{dur + 0.5:.3f}", "-i", WORK / "src.mp4",
              "-filter_complex_script", script, "-map", "[vo]", "-map", "[ao]",
              "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-t", f"{total:.2f}",
+             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-t", f"{dur:.2f}",
              "-movflags", "+faststart", out])
     return out
 

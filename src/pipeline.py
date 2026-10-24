@@ -26,7 +26,7 @@ GROQ_MODEL = os.environ.get("GROQ_WHISPER_MODEL") or "whisper-large-v3"
 WHISPER = os.environ.get("WHISPER_MODEL") or "medium"
 LANG = os.environ.get("LANG_CODE") or None
 N_CLIPS = int(os.environ.get("NUM_CLIPS") or "5")
-HOOK_MODE = (os.environ.get("HOOK_MODE") or "auto").lower()    # auto | always | never
+HOOK_MODE = (os.environ.get("HOOK_MODE") or "always").lower()  # always | auto | never
 TEXT_FIX = (os.environ.get("TEXT_FIX") or "on").lower()        # on | off
 MIN_D, MAX_D = 25, 60
 API = f"https://api.telegram.org/bot{TOKEN}"
@@ -459,13 +459,14 @@ class FaceFinder:
     def ok(self):
         return self.yunet is not None or bool(self.haar)
 
-    def detect(self, img):
+    def detect(self, img, thr=0.6):
         """وجوه الصورة: [(cx, cy, w, h, mouth_x, mouth_y)] بإحداثيات الصورة."""
         h, w = img.shape[:2]
         out = []
         try:
             if self.yunet is not None:
                 self.yunet.setInputSize((w, h))
+                self.yunet.setScoreThreshold(thr)
                 _, faces = self.yunet.detect(img)
                 for f in (faces if faces is not None else []):
                     x, y, fw, fh = [float(v) for v in f[:4]]
@@ -521,8 +522,8 @@ Return ONLY JSON: {"faces": [{"box_2d": [ymin, xmin, ymax, xmax]}]} with coordin
 
 
 def gemini_faces(frame):
-    """بديل: Gemini يحدد أماكن الوجوه إذا فشل الكاشف المحلي (حد أقصى 8 طلبات لكل تشغيل)."""
-    if not GEMINI_KEY or _FACE_CALLS[0] >= 8:
+    """بديل: Gemini يحدد أماكن الوجوه إذا فشل الكاشف المحلي (حد أقصى 30 طلباً لكل تشغيل)."""
+    if not GEMINI_KEY or _FACE_CALLS[0] >= 30:
         return []
     _FACE_CALLS[0] += 1
     try:
@@ -557,33 +558,96 @@ def detect_cuts(src, start, dur, thr=0.15):
     return out
 
 
-def read_frame(cap, t):
+def read_frame(cap, t, width=DET_W):
     cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
     ok, fr = cap.read()
     if not ok:
         return None
     h, w = fr.shape[:2]
-    if w > DET_W:
-        fr = cv2.resize(fr, (DET_W, int(h * DET_W / w)))
+    if w > width:
+        fr = cv2.resize(fr, (width, int(h * width / w)))
     return fr
 
 
+def motion_people(cap, t0, t1):
+    """بديل أخير بدون كشف وجوه: يحدد مكان شخصين من الحركة (تنفّس، إيماءات) في لقطة واسعة ثابتة."""
+    d = t1 - t0
+    if d < 0.8:
+        return []
+    n = 12
+    grays = []
+    for i in range(n):
+        fr = read_frame(cap, t0 + 0.2 + (d - 0.4) * i / (n - 1), 480)
+        if fr is not None:
+            grays.append(cv2.GaussianBlur(cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY), (7, 7), 0).astype(np.float32))
+    if len(grays) < 6:
+        return []
+    h, w = grays[0].shape
+    sd = np.std(np.stack(grays), axis=0)
+    mask = (sd > max(3.0, float(np.percentile(sd, 80)))).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    mask = cv2.dilate(mask, np.ones((9, 9), np.uint8), iterations=1)
+    col = mask.sum(axis=0).astype(np.float32)
+    col = cv2.GaussianBlur(col.reshape(1, -1), (0, 0), sigmaX=max(w * 0.02, 1.0)).ravel()
+    if col.max() < 0.15 * h:
+        return []
+    idx = np.where(col > 0.3 * col.max())[0]
+    groups = np.split(idx, np.where(np.diff(idx) > 0.1 * w)[0] + 1)      # كتل حركة منفصلة أفقياً
+    clusters = [g for g in groups if len(g) and col[g].max() >= 0.15 * h]
+    clusters.sort(key=lambda g: -float(col[g].sum()))
+    if len(clusters) < 2:
+        return []
+    centers = sorted(float((g * col[g]).sum() / col[g].sum()) for g in clusters[:2])
+    if centers[1] - centers[0] < 0.3 * w:
+        return []
+    faces = []
+    for p in centers:
+        lo, hi = max(int(p - 0.08 * w), 0), min(int(p + 0.08 * w), w)
+        rows = np.where(mask[:, lo:hi].sum(axis=1) >= 3)[0]
+        if len(rows) == 0:
+            return []
+        faces.append((p / w, min(rows[0] / h + 0.09, 0.9), 0.08, 0.14))
+    return faces
+
+
 def shot_faces(cap, finder, t0, t1):
-    """وجوه لقطة كاملة (إحداثيات نسبية 0-1): (cx, cy, w, h)."""
+    """وجوه لقطة كاملة (نسبية 0-1): ([(cx, cy, w, h)], مصدر الكشف). يجرب أكثر من طريقة قبل الاستسلام."""
     d = t1 - t0
     if d > 0.6:
         times = sorted({min(max(t0 + d * f, t0 + 0.15), t1 - 0.1) for f in (0.2, 0.5, 0.8)})
     else:
         times = [(t0 + t1) / 2]
-    frames = [f for f in (read_frame(cap, t) for t in times) if f is not None]
-    if not frames:
-        return []
-    hh, ww = frames[0].shape[:2]
-    dets = [finder.detect(f) for f in frames] if finder.ok else [[] for _ in frames]
-    faces = [(v[0] / ww, v[1] / hh, v[2] / ww, v[3] / hh) for v in merge_slots(dets)]
-    if not faces:
-        faces = gemini_faces(frames[len(frames) // 2])
-    return faces
+
+    def clear(faces):       # شخصان، أو وجه كبير واضح (لقطة قريبة)
+        return len(faces) >= 2 or (faces and max(f[3] for f in faces) >= 0.20)
+
+    faces, src_tag, mid = [], "none", None
+    if finder.ok:
+        for width, thr in ((DET_W, 0.6), (1280, 0.4)):          # تمريرة ثانية بدقة أعلى وعتبة أخفض
+            frames = [f for f in (read_frame(cap, t, width) for t in times) if f is not None]
+            if not frames:
+                return [], "none"
+            if mid is None:
+                mid = frames[len(frames) // 2]
+            hh, ww = frames[0].shape[:2]
+            found = [(v[0] / ww, v[1] / hh, v[2] / ww, v[3] / hh)
+                     for v in merge_slots([finder.detect(f, thr) for f in frames])]
+            if len(found) > len(faces):
+                faces, src_tag = found, f"finder@{width}"
+            if clear(faces):
+                return faces, src_tag
+    else:
+        mid = read_frame(cap, times[len(times) // 2])
+    if mid is not None:
+        g = gemini_faces(mid)                                    # Gemini يرى الصورة ويحدد الوجوه
+        if len(g) > len(faces):
+            faces, src_tag = g, "gemini"
+        if clear(faces):
+            return faces, src_tag
+    m = motion_people(cap, t0, t1)                               # بديل أخير: الحركة
+    if len(m) == 2 and len(faces) < 2:
+        return m, "motion"
+    return faces, src_tag
 
 
 def classify_layout(faces, sw, sh):
@@ -621,8 +685,9 @@ def plan_layouts(src, start, end, finder, cap, sw, sh):
     for a, b in zip(bounds, bounds[1:]):
         if b - a < 0.05:
             continue
-        lay = classify_layout(shot_faces(cap, finder, start + a, start + b), sw, sh)
-        lay["t0"], lay["t1"] = a, b
+        faces, tag = shot_faces(cap, finder, start + a, start + b)
+        lay = classify_layout(faces, sw, sh)
+        lay["t0"], lay["t1"], lay["src"] = a, b, tag
         parts.append(lay)
     merged = []
     for p in parts:
@@ -776,11 +841,12 @@ def build_ass(segs, hook, total, path, layouts=None):
 
     if hook:
         first = layouts[0]["kind"] if layouts else "single"
-        pos = f"\\an8\\pos(540,40)\\fs{int(size * 0.8)}" if first == "stack" else ""
+        y = 40 if first == "stack" else 250
+        tags = f"\\an8\\move(540,{y + 36},540,{y},0,280)\\fad(180,320)"
+        if first == "stack":
+            tags += f"\\fs{int(size * 0.8)}"
         text = wrap_hook(hook.upper() if latin else hook, 20 if latin else 17)
-        lines.append(f"Dialogue: 2,{ts(0.1)},{ts(min(3.8, total))},Hook,,0,0,0,,"
-                     f"{{{pos}\\fad(90,260)\\fscx55\\fscy55\\t(0,150,\\fscx110\\fscy110)"
-                     f"\\t(150,270,\\fscx100\\fscy100)}}{text}")
+        lines.append(f"Dialogue: 2,{ts(0.1)},{ts(min(4.4, total))},Hook,,0,0,0,,{{{tags}}}{text}")
 
     ms = int(total * 1000)
     lines.append(f"Dialogue: 5,{ts(0)},{ts(total)},Bar,,0,0,0,,"
@@ -790,6 +856,35 @@ def build_ass(segs, hook, total, path, layouts=None):
 
 
 # ---------------------------------------------------------------- render
+HOOK_PROMPT = """Here is the transcript of a short vertical video clip (a podcast, talk or interview).
+Write ONE on-screen hook line that appears in the first seconds.
+Goal: in 4-9 words, tell the viewer exactly what this clip is about, or what surprising point or promise they will get, so they keep watching.
+Rules:
+- Same language as the speakers. If Arabic: simple, clear Arabic that Algerian, Gulf and Egyptian viewers all understand (no heavy formal wording). If English: plain, punchy English.
+- Specific to THIS clip (use its real topic), never generic, never misleading. No emojis, no hashtags, no quotation marks, no final dot.
+- Prefer a strong question, a bold claim, or a clear benefit.
+Return ONLY JSON: {{"hook": "..."}}
+
+TRANSCRIPT:
+{text}"""
+
+
+def make_hook(words, start, end):
+    """يكتب هوكاً يشرح فكرة المقطع من النص المصحَّح."""
+    if not GEMINI_KEY:
+        return ""
+    text = " ".join(w["w"] for w in words if w["s"] >= start - 0.05 and w["e"] <= end + 0.2)
+    if len(text.split()) < 8:
+        return ""
+    try:
+        res = gemini_generate([{"text": HOOK_PROMPT.format(text=text[:6000])}], temperature=0.5)
+        h = str(res.get("hook", "")).strip().strip('"\u201c\u201d\u00ab\u00bb').rstrip(".\u060c")
+        return h if 2 <= len(h.split()) <= 14 else ""
+    except Exception as e:  # noqa
+        print("hook failed:", e, flush=True)
+        return ""
+
+
 def show_hook(clip):
     hook = (clip.get("hook") or "").strip()
     ctype = clip.get("content_type", "")
@@ -835,7 +930,7 @@ def render(idx, clip, src, words, sw, sh, finder, cap):
 
     # الفيديو يبقى متصلاً (بدون حذف صمت أو قص). الكاميرا والتقسيم يتبعان تبديل المصوّر الأصلي
     layouts = plan_layouts(src, start, end, finder, cap, sw, sh)
-    print("layouts:", [(round(l["t0"], 1), round(l["t1"], 1), l["kind"]) for l in layouts], flush=True)
+    print("layouts:", [(round(l["t0"], 1), round(l["t1"], 1), l["kind"], l.get("src", "")) for l in layouts], flush=True)
 
     hook = show_hook(clip)
     ass = WORK / f"c{idx}.ass"
@@ -910,6 +1005,9 @@ def main():
         for i, clip in enumerate(clips, 1):
             say(f"🎬 مونتاج المقطع {i}/{len(clips)}...")
             clip_words = fix_text(i, clip, words, src)
+            hook = make_hook(clip_words, clip["start"], clip["end"])
+            if hook:
+                clip["hook"] = hook
             out = render(i, clip, src, clip_words, sw, sh_, finder, cap)
             if out:
                 send_video(out, clip.get("title") or clip.get("hook") or f"Short {i}")

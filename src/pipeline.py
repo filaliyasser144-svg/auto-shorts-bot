@@ -422,7 +422,7 @@ def fix_text(idx, clip, words, src):
         return words
 
 
-# ---------------------------------------------------------------- faces + camera shots + layouts
+# ---------------------------------------------------------------- faces + camera shots + speaker following
 YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 DET_W = 800        # عرض الصورة المستخدمة للكشف (أسرع وكافٍ)
 
@@ -514,7 +514,6 @@ def merge_slots(det_lists):
     return [sl["v"] for sl in keep][:4]
 
 
-PW, PH, BAND = 1080, 850, 220      # الشاشة المقسومة: لوحة علوية 850 + شريط النص 220 + لوحة سفلية 850 = 1920
 _FACE_CALLS = [0]
 
 FACES_PROMPT = """Detect every human face visible in this image (front, side or partly turned, small or large).
@@ -650,8 +649,12 @@ def shot_faces(cap, finder, t0, t1):
     return faces, src_tag
 
 
+MIN_TURN = 2.5     # كلام شخص أقصر من هذا (مقاطعة قصيرة) لا يحرّك الكاميرا
+PAN = 0.45         # مدة انتقال الكاميرا (ثانية) بحركة ناعمة
+
+
 def classify_layout(faces, sw, sh):
-    """single = وجه واحد (أو شخصان قريبان يكفيهما إطار عمودي)، stack = شخصان متباعدان: واحد فوق وواحد تحت."""
+    """single = وجه واحد (أو شخصان قريبان يكفيهما إطار عمودي)، follow = شخصان متباعدان: الكاميرا تتبع المتحدث."""
     if not faces:
         return {"kind": "single", "face": None}
     faces = sorted(faces, key=lambda f: -f[2] * f[3])[:2]
@@ -664,21 +667,104 @@ def classify_layout(faces, sw, sh):
     if (right - left) * 1.3 <= crop_w:
         return {"kind": "single", "face": ((left + right) / 2, (faces[0][1] + faces[1][1]) / 2,
                                              max(f[2] for f in faces), max(f[3] for f in faces))}
-    return {"kind": "stack", "faces": faces}
+    return {"kind": "follow", "faces": faces}
 
 
-def same_layout(a, b):
-    if a["kind"] != b["kind"]:
-        return False
-    if a["kind"] == "stack":
-        return all(abs(x[0] - y[0]) < 0.05 for x, y in zip(a["faces"], b["faces"]))
-    if a["face"] is None or b["face"] is None:
-        return a["face"] is b["face"]
-    return abs(a["face"][0] - b["face"][0]) < 0.05
+def fill_unknown(flat):
+    last = None
+    for iv in flat:
+        if iv[2] == -1 and last is not None:
+            iv[2] = last
+        elif iv[2] != -1:
+            last = iv[2]
+    nxt = None
+    for iv in reversed(flat):
+        if iv[2] == -1 and nxt is not None:
+            iv[2] = nxt
+        elif iv[2] != -1:
+            nxt = iv[2]
+    for iv in flat:
+        if iv[2] == -1:
+            iv[2] = 0
+
+
+def smooth_runs(flat, min_turn):
+    """كلام أقصر من min_turn لا يحرّك الكاميرا: يُدمج مع من قبله."""
+    while True:
+        runs = []
+        for idx, iv in enumerate(flat):
+            if runs and runs[-1][0] == iv[2]:
+                runs[-1][2] = idx
+                runs[-1][3] += iv[1] - iv[0]
+            else:
+                runs.append([iv[2], idx, idx, iv[1] - iv[0]])
+        short = [r for r in runs if r[3] < min_turn]
+        if len(runs) < 2 or not short:
+            return
+        r = min(short, key=lambda r: r[3])
+        ri = runs.index(r)
+        new = runs[ri - 1][0] if ri > 0 else runs[ri + 1][0]
+        for idx in range(r[1], r[2] + 1):
+            flat[idx][2] = new
+
+
+def sample_gray(cap, t0, t1, fps=8, width=480):
+    cap.set(cv2.CAP_PROP_POS_MSEC, t0 * 1000)
+    native = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    step = max(int(round(native / fps)), 1)
+    times, frames = [], []
+    for i in range(int((t1 - t0) * native)):
+        if not cap.grab():
+            break
+        if i % step == 0:
+            ok, fr = cap.retrieve()
+            if not ok:
+                break
+            h, w = fr.shape[:2]
+            if w > width:
+                fr = cv2.resize(fr, (width, int(h * width / w)))
+            frames.append(cv2.GaussianBlur(cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY), (5, 5), 0).astype(np.float32))
+            times.append(t0 + i / native)
+    return times, frames
+
+
+def speaker_runs(cap, faces, t0, t1):
+    """من يتكلم في كل لحظة (حسب حركة الوجه والفم) مع تجاهل المقاطعات القصيرة. يرجع [(من, إلى, رقم الوجه)]."""
+    if len(faces) < 2:
+        return [(t0, t1, 0)]
+    times, frames = sample_gray(cap, t0, t1)
+    if len(frames) < 3:
+        return [(t0, t1, 0)]
+    h, w = frames[0].shape
+    regs = []
+    for cx, cy, fw, fh in faces:
+        regs.append((int(max((cx - 0.5 * fw) * w, 0)), int(min((cx + 0.5 * fw) * w, w)),
+                     int(max((cy - 0.05 * fh) * h, 0)), int(min((cy + 0.65 * fh) * h, h))))
+    en = np.zeros((len(frames) - 1, len(faces)))
+    for k, (x0, x1, y0, y1) in enumerate(regs):
+        if x1 - x0 < 3 or y1 - y0 < 3:
+            continue
+        for j in range(len(frames) - 1):
+            en[j, k] = float(np.abs(frames[j + 1][y0:y1, x0:x1] - frames[j][y0:y1, x0:x1]).mean())
+    flat = []
+    for j in range(len(frames) - 1):
+        order = np.argsort(en[j])[::-1]
+        best, second = en[j][order[0]], en[j][order[1]]
+        flat.append([times[j], times[j + 1], int(order[0]) if (best > 0.8 and best > 1.2 * second) else -1])
+    flat[0][0], flat[-1][1] = t0, t1
+    fill_unknown(flat)
+    smooth_runs(flat, MIN_TURN)
+    runs = []
+    for iv in flat:
+        if runs and runs[-1][2] == iv[2]:
+            runs[-1][1] = iv[1]
+        else:
+            runs.append([iv[0], iv[1], iv[2]])
+    return [tuple(r) for r in runs]
 
 
 def plan_layouts(src, start, end, finder, cap, sw, sh):
-    """يقسّم المقطع عند كل تبديل كاميرا، ويحدد لكل لقطة: شاشة كاملة أو تقسيم."""
+    """يقسّم المقطع عند كل تبديل كاميرا، ويحدد لكل لقطة: وجه ثابت أو كاميرا تتبع المتحدث."""
     cuts = detect_cuts(src, start, end - start)
     bounds = [0.0] + cuts + [end - start]
     parts = []
@@ -688,14 +774,11 @@ def plan_layouts(src, start, end, finder, cap, sw, sh):
         faces, tag = shot_faces(cap, finder, start + a, start + b)
         lay = classify_layout(faces, sw, sh)
         lay["t0"], lay["t1"], lay["src"] = a, b, tag
+        if lay["kind"] == "follow":
+            runs = speaker_runs(cap, lay["faces"], start + a, start + b)
+            lay["runs"] = [(ra - start, rb - start, k) for ra, rb, k in runs]
         parts.append(lay)
-    merged = []
-    for p in parts:
-        if merged and same_layout(merged[-1], p):
-            merged[-1]["t1"] = p["t1"]
-        else:
-            merged.append(p)
-    return merged or [{"kind": "single", "face": None, "t0": 0.0, "t1": end - start}]
+    return parts or [{"kind": "single", "face": None, "t0": 0.0, "t1": end - start}]
 
 
 # ---------------------------------------------------------------- captions + hook
@@ -830,21 +913,15 @@ def build_ass(segs, hook, total, path, layouts=None):
             end = min(end, ps[i + 1][0]["nt"] - 0.02)
         end = max(end, start + 0.3)
         text = two_lines([esc(w["w"]) for w in ph], maxc)
-        for lay in layouts:                 # النص يتبع الشاشة: في الوسط بين الشخصين عند التقسيم
+        for lay in layouts:                 # عبارة تعبر حدود لقطتين تُقسم عندهما
             s2, e2 = max(start, lay["t0"]), min(end, lay["t1"])
             if e2 - s2 < 0.08:
                 continue
-            tags = base_tags
-            if lay["kind"] == "stack":
-                tags = f"\\an5\\pos(540,960)\\fs{int(size * 0.84)}" + base_tags
-            lines.append(f"Dialogue: 0,{ts(s2)},{ts(e2)},Cap,,0,0,0,,{{{tags}}}{text}")
+            lines.append(f"Dialogue: 0,{ts(s2)},{ts(e2)},Cap,,0,0,0,,{{{base_tags}}}{text}")
 
     if hook:
-        first = layouts[0]["kind"] if layouts else "single"
-        y = 40 if first == "stack" else 250
+        y = 250
         tags = f"\\an8\\move(540,{y + 36},540,{y},0,280)\\fad(180,320)"
-        if first == "stack":
-            tags += f"\\fs{int(size * 0.8)}"
         text = wrap_hook(hook.upper() if latin else hook, 20 if latin else 17)
         lines.append(f"Dialogue: 2,{ts(0.1)},{ts(min(4.4, total))},Hook,,0,0,0,,{{{tags}}}{text}")
 
@@ -895,19 +972,6 @@ def show_hook(clip):
     return hook if ctype in ("educational", "important") else ""
 
 
-def panel_crop(face, sw, sh):
-    """قصّة لوحة (1080x850) حول وجه شخص في اللقطة الواسعة، بتقريب معقول."""
-    cx, cy, fw, fh = face
-    ch = min(max(fh * sh / 0.30, PH / 1.8), sh)
-    cw = ch * PW / PH
-    if cw > sw:
-        cw = sw
-        ch = cw * PH / PW
-    x = int(min(max(cx * sw - cw / 2, 0), sw - cw)) // 2 * 2
-    y = int(min(max(cy * sh - 0.42 * ch, 0), sh - ch)) // 2 * 2
-    return int(cw) // 2 * 2, int(ch) // 2 * 2, x, y
-
-
 def single_crop(face, sw, sh):
     if sw / sh >= 9 / 16:
         base_h, base_w = sh, sh * 9 / 16
@@ -928,7 +992,7 @@ def render(idx, clip, src, words, sw, sh, finder, cap):
     if not cw_words:
         return None
 
-    # الفيديو يبقى متصلاً (بدون حذف صمت أو قص). الكاميرا والتقسيم يتبعان تبديل المصوّر الأصلي
+    # الفيديو يبقى متصلاً (بدون حذف صمت أو قص). الكاميرا تتبع المتحدث وتتبدل مع تبديل المصوّر الأصلي
     layouts = plan_layouts(src, start, end, finder, cap, sw, sh)
     print("layouts:", [(round(l["t0"], 1), round(l["t1"], 1), l["kind"], l.get("src", "")) for l in layouts], flush=True)
 
@@ -947,16 +1011,31 @@ def render(idx, clip, src, words, sw, sh, finder, cap):
     for i, lay in enumerate(layouts):
         fa, fb = edges[i], edges[i + 1]
         head = f"[vs{i}]trim=start_frame={fa}:end_frame={fb},setpts=PTS-STARTPTS"
-        d_i = (fb - fa) / 30
-        if lay["kind"] == "stack":
-            parts.append(f"{head},split=2[sa{i}][sb{i}]")
-            for tag, face in zip(("a", "b"), lay["faces"]):
-                cw_, ch_, x, y = panel_crop(face, sw, sh)
-                parts.append(f"[s{tag}{i}]crop={cw_}:{ch_}:{x}:{y},scale={PW}:{PH}:flags=lanczos,"
-                             f"setsar=1,format=yuv420p[t{tag}{i}]")
-            parts.append(f"color=c=0x0e0e0e:s={PW}x{BAND}:r=30:d={d_i + 1:.3f},format=yuv420p,setsar=1[bd{i}]")
-            parts.append(f"[ta{i}][bd{i}][tb{i}]vstack=inputs=3,trim=end_frame={fb - fa},"
-                         f"setpts=PTS-STARTPTS,fps=30[v{i}]")
+        if lay["kind"] == "follow":
+            faces = lay["faces"]
+            fh = max(f[3] for f in faces)
+            zoom = min(1.0, max(0.75, fh / 0.16))
+            if sw / sh >= 9 / 16:
+                base_h, base_w = sh, sh * 9 / 16
+            else:
+                base_w, base_h = sw, sw * 16 / 9
+            ch_, cw_ = int(base_h * zoom) // 2 * 2, int(base_w * zoom) // 2 * 2
+            cy = sum(f[1] for f in faces) / len(faces)
+            y = int(min(max(cy * sh - 0.38 * ch_, 0), sh - ch_)) // 2 * 2
+
+            def xpx(k):
+                return int(min(max(faces[k][0] * sw - cw_ / 2, 0), sw - cw_))
+
+            runs = lay["runs"]
+            kfs = [(0.0, xpx(runs[0][2]))]
+            for r in runs[1:]:
+                kfs.append((max(r[0] - lay["t0"] - 0.1, 0.05), xpx(r[2])))
+            expr = str(kfs[0][1])
+            for (_, xp), (tc, xc) in zip(kfs, kfs[1:]):          # انتقال ناعم (smoothstep) نحو المتحدث الجديد
+                u = f"clip((t-{tc:.3f})/{PAN},0,1)"
+                expr += f"+({xc - xp})*({u}*{u}*(3-2*{u}))"
+            parts.append(f"{head},crop=w={cw_}:h={ch_}:x='{expr}':y={y},scale={W}:{H}:flags=lanczos,"
+                         f"setsar=1,format=yuv420p,fps=30[v{i}]")
         else:
             cw_, ch_, x, y = single_crop(lay["face"], sw, sh)
             parts.append(f"{head},crop={cw_}:{ch_}:{x}:{y},scale={W}:{H}:flags=lanczos,"

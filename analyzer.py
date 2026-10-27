@@ -8,18 +8,18 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 def analyze_podcast_from_url(video_url):
     try:
-        print("جاري تحميل صوت البودكاست لتحليله مباشرة عبر الذكاء الاصطناعي...")
+        print("جاري تحميل صوت البودكاست بطريقة مضمونة...")
         
-        # التحقق من الكوكيز إن وجدت لتجنب الحظر
+        # التحقق من وجود الكوكيز بشكل صحيح
         cookie_arg = []
-        if os.path.exists("cookies.txt") and os.path.getsize("cookies.txt") > 0:
+        if os.path.exists("cookies.txt") and os.path.getsize("cookies.txt") > 10:
             cookie_arg = ["--cookies", "cookies.txt"]
 
-        # تحميل الصوت فقط بصيغة mp3 لتوفير الوقت والمساحة
+        # استخدام صيغة مرنة ومضمونة لتحميل الصوت وتجنب أي خطأ في الصيغ
         cmd = [
             "yt-dlp",
         ] + cookie_arg + [
-            "--extractor-args", "youtube:player_client=android",
+            "-f", "bestaudio/best",
             "-x", "--audio-format", "mp3",
             "-o", "temp_audio.mp3",
             video_url
@@ -33,7 +33,7 @@ def analyze_podcast_from_url(video_url):
                     audio_path = f
                     break
         
-        print("جاري رفع الصوت إلى Gemini والاستماع إليه لاختيار أفضل المقاطع...")
+        print("جاري رفع الصوت إلى Gemini وتحليله استماعاً لاختيار أفضل المقاطع...")
         audio_file = genai.upload_file(audio_path)
         
         model = genai.GenerativeModel('gemini-1.5-pro')

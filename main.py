@@ -1,10 +1,9 @@
 import os
 import sys
 import requests
-from analyzer import get_youtube_transcript, analyze_podcast_with_gemini
+from analyzer import analyze_podcast_from_url
 from processor import download_and_cut_clip
 
-# جلب المتغيرات السرية
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -26,21 +25,14 @@ if __name__ == "__main__":
         print("خطأ: لم يتم إدخال رابط يوتيوب.")
         sys.exit(1)
         
-    print(f"جاري جلب نص الفيديو: {YOUTUBE_URL}")
-    text, _ = get_youtube_transcript(YOUTUBE_URL)
+    print(f"جاري بدء النظام الذكي لرابط يوتيوب: {YOUTUBE_URL}")
     
-    if not text:
-        print("عذراً، لم نتمكن من جلب نص الفيديو.")
-        sys.exit(1)
-        
-    print("جاري تحليل النص واستخراج أفضل مقطع عبر Gemini...")
-    clips = analyze_podcast_with_gemini(text)
+    clips = analyze_podcast_from_url(YOUTUBE_URL)
     
     if not clips:
-        print("لم يتم العثور على مقاطع مناسبة.")
+        print("لم يتم العثور على مقاطع مناسبة أو حدث خطأ في الاستماع للبودكاست.")
         sys.exit(1)
         
-    # نأخذ أول مقطع مقترح كبداية لتوفير الوقت
     best_clip = clips[0]
     start = best_clip.get("start_time")
     end = best_clip.get("end_time")
@@ -53,8 +45,6 @@ if __name__ == "__main__":
     if output_file and os.path.exists(output_file):
         caption = f"🔥 {title}\n\nتم توليد هذا الشورت تلقائياً عبر نظامك الذكي 🚀"
         send_telegram_video(output_file, caption)
-        
-        # تنظيف الملف المحلي
         os.remove(output_file)
     else:
         print("فشل معالجة الفيديو.")

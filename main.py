@@ -46,7 +46,7 @@ if __name__ == "__main__":
     end = best_clip.get("end_time")
     title = best_clip.get("title", "شورت بودكاست جديد")
     
-    print(, f"المقطع المختار: من {start} إلى {end} - العنوان: {title}")
+    print(f"المقطع المختار: من {start} إلى {end} - العنوان: {title}")
     
     output_file = download_and_cut_clip(YOUTUBE_URL, start, end)
     

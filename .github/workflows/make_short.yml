@@ -1,0 +1,40 @@
+name: Auto Podcast to Shorts
+
+on:
+  workflow_dispatch:
+    inputs:
+      youtube_url:
+        description: 'أدخل رابط يوتيوب للبودكاست'
+        required: true
+        type: string
+
+jobs:
+  build-short:
+- runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get.install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Short Generator
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          YOUTUBE_URL: ${{ github.event.inputs.youtube_url }}
+        run: |
+          python main.py

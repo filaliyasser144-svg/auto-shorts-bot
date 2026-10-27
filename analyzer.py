@@ -9,26 +9,18 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 def get_youtube_transcript(video_url):
     try:
-        # استخراج معرف الفيديو من الرابط
+        # استخراج معرف الفيديو من الرابط بدقة
         if "watch?v=" in video_url:
             video_id = video_url.split("watch?v=")[1].split("&")[0]
         elif "youtu.be/" in video_url:
             video_id = video_url.split("youtu.be/")[1].split("?")[0]
         else:
-            raise ValueError("رابط يوتيوب غير صالح")
+            video_id = video_url.strip()
             
-        # استخدام الطريقة الآمنة الحديثة لجلب النص
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        
-        # محاولة البحث عن العربية أو الإنجليزية أو أزي كود متاحة
-        try:
-            transcript = transcript_list.find_transcript(['ar', 'en'])
-        except:
-            transcript = transcript_list.find_generated_transcript(['ar', 'en'])
-            
-        transcript_data = transcript.fetch()
-        full_text = " ".join([item['text'] for item in transcript_data])
-        return full_text, transcript_data
+        # الطريقة الأبسط والأكثر استقراراً لجلب النصوص
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+        full_text = " ".join([item['text'] for item in transcript_list])
+        return full_text, transcript_list
     except Exception as e:
         print(f"خطأ في جلب النص: {e}")
         return None, None
@@ -38,7 +30,7 @@ def analyze_podcast_with_gemini(transcript_text):
     
     prompt = f"""
     أنت خبير مونتاج وتسويق عبر الفيديوهات القصيرة (Reels & TikTok). 
-    أمامك نص بودكاست كامل. أريدك أن تحلل النص وتستخرج أفضل 3 مقاطع حماسية، مثيرة للجدل، أو تحمل فائدة عالية جداً.
+    أمامك نص بودكاست بالهجة الجزائرية. أريدك أن تحلل النص وتستخرج أفضل 3 مقاطع حماسية، مثيرة للجدل، أو تحمل فائدة عالية جداً.
     يجب أن يكون كل مقطع مدته ما بين 30 إلى 50 ثانية.
     
     أعطني النتيجة حصرياً بصيغة JSON تحتوي على قائمة بالشكل التالي بدون أي نصوص إضافية:

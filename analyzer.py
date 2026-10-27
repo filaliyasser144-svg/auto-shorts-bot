@@ -1,6 +1,6 @@
 import os
 import json
-from youtube_transcript_api import YouTubeTranscriptApi
+import subprocess
 import google.generativeai as genai
 
 # إعداد مفتاح Gemini API
@@ -9,20 +9,51 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 def get_youtube_transcript(video_url):
     try:
-        # استخراج معرف الفيديو من الرابط بدقة
-        if "watch?v=" in video_url:
-            video_id = video_url.split("watch?v=")[1].split("&")[0]
-        elif "youtu.be/" in video_url:
-            video_id = video_url.split("youtu.be/")[1].split("?")[0]
-        else:
-            video_id = video_url.strip()
+        print("جاري استخراج الترجمة باستخدام yt-dlp...")
+        
+        # استخدام yt-dlp لتحميل الترجمة التلقائية أو اليدوية
+        cmd = [
+            "yt-dlp",
+            "--write-auto-subs",
+            "--skip-download",
+            "--sub-format", "json3",
+            "--sub-lang", "ar,en",
+            "-o", "temp_sub",
+            video_url
+        ]
+        subprocess.run(cmd, check=True)
+        
+        # البحث عن ملف الترجمة الناتج
+        sub_file = None
+        for f in os.listdir("."):
+            if f.startswith("temp_sub") and f.endswith(".json3"):
+                sub_file = f
+                break
+                
+        if not sub_file:
+            print("لم يتم العثور على ملف ترجمة جاهز.")
+            return None, None
             
-        # الطريقة الأبسط والأكثر استقراراً لجلب النصوص
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-        full_text = " ".join([item['text'] for item in transcript_list])
-        return full_text, transcript_list
+        # قراءة وتحليل ملف الترجمة واستخراج النصوص
+        with open(sub_file, "r", encoding="utf-8") as file:
+            data = json.load(file)
+            events = data.get("events", [])
+            text_list = []
+            for event in events:
+                segs = event.get("segs", [])
+                for seg in segs:
+                    text_list.append(seg.get("utf8", ""))
+            full_text = " ".join(text_list)
+            
+        # تنظيف الملفات المؤقتة
+        for f in os.listdir("."):
+            if f.startswith("temp_sub"):
+                os.remove(f)
+                
+        return full_text, []
+        
     except Exception as e:
-        print(f"خطأ في جلب النص: {e}")
+        print(f"خطأ في استخراج النص: {e}")
         return None, None
 
 def analyze_podcast_with_gemini(transcript_text):
@@ -55,11 +86,3 @@ def analyze_podcast_with_gemini(transcript_text):
     except Exception as e:
         print(f"خطأ في تحليل الذكاء الاصطناعي: {e}")
         return []
-
-if __name__ == "__main__":
-    test_url = input("أدخل رابط يوتيوب للبودكاست: ")
-    text, raw_list = get_youtube_transcript(test_url)
-    if text:
-        print("جاري تحليل النص عبر Gemini...")
-        clips = analyze_podcast_with_gemini(text)
-        print(json.dumps(clips, indent=2, ensure_ascii=False))

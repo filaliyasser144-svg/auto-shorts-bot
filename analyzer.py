@@ -6,73 +6,63 @@ import google.generativeai as genai
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 
-def get_youtube_transcript(video_url):
+def analyze_podcast_from_url(video_url):
     try:
-        print("جاري استخراج الترجمة باستخدام الكوكيز وتجاوز الحظر...")
+        print("جاري تحميل صوت البودكاست لتحليله مباشرة عبر الذكاء الاصطناعي...")
+        
+        # التحقق من الكوكيز إن وجدت لتجنب الحظر
+        cookie_arg = []
+        if os.path.exists("cookies.txt") and os.path.getsize("cookies.txt") > 0:
+            cookie_arg = ["--cookies", "cookies.txt"]
+
+        # تحميل الصوت فقط بصيغة mp3 لتوفير الوقت والمساحة
         cmd = [
             "yt-dlp",
-            "--cookies", "cookies.txt",
+        ] + cookie_arg + [
             "--extractor-args", "youtube:player_client=android",
-            "--write-auto-subs",
-            "--skip-download",
-            "--sub-format", "json3",
-            "--sub-lang", "ar,en",
-            "-o", "temp_sub",
+            "-x", "--audio-format", "mp3",
+            "-o", "temp_audio.mp3",
             video_url
         ]
         subprocess.run(cmd, check=True)
         
-        sub_file = None
-        for f in os.listdir("."):
-            if f.startswith("temp_sub") and f.endswith(".json3"):
-                sub_file = f
-                break
-                
-        if not sub_file:
-            print("لم يتم العثور على ملف ترجمة جاهز.")
-            return None, None
+        audio_path = "temp_audio.mp3"
+        if not os.path.exists(audio_path):
+            for f in os.listdir("."):
+                if f.startswith("temp_audio"):
+                    audio_path = f
+                    break
+        
+        print("جاري رفع الصوت إلى Gemini والاستماع إليه لاختيار أفضل المقاطع...")
+        audio_file = genai.upload_file(audio_path)
+        
+        model = genai.GenerativeModel('gemini-1.5-pro')
+        prompt = """
+        أنت خبير مونتاج وتسويق عبر الفيديوهات القصيرة (Reels & TikTok). 
+        استمع إلى هذا الصوت بعناية (فهو بودكاست باللهجة الجزائرية)، واستخرج أفضل 3 مقاطع حماسية، مثيرة للجدل، أو تحمل فائدة عالية جداً.
+        يجب أن يكون كل مقطع مدته ما بين 30 إلى 50 ثانية.
+        
+        أعطني النتيجة حصرياً بصيغة JSON تحتوي على قائمة بالشكل التالي بدون أي نصوص إضافية، مع تحديد الثواني بدقة (start_time و end_time بأرقام صحيحة بالثواني):
+        [
+          {
+            "start_time": 45,
+            "end_time": 90,
+            "title": "عنوان جذاب جداً ومثير للشورت (Hook)",
+            "reason": "لماذا هذا المقطع سينتشر؟"
+          }
+        ]
+        """
+        
+        response = model.generate_content([audio_file, prompt])
+        
+        # تنظيف الملف الصوتي المؤقت
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
             
-        with open(sub_file, "r", encoding="utf-8") as file:
-            data = json.load(file)
-            events = data.get("events", [])
-            text_list = []
-            for event in events:
-                segs = event.get("segs", [])
-                for seg in segs:
-                    text_list.append(seg.get("utf8", ""))
-            full_text = " ".join(text_list)
-            
-        for f in os.listdir("."):
-            if f.startswith("temp_sub"):
-                os.remove(f)
-                
-        return full_text, []
+        clean_text = response.text.replace("```json", "").replace("```", "").strip()
+        clips_data = json.loads(clean_text)
+        return clips_data
         
     except Exception as e:
-        print(f"خطأ في استخراج النص: {e}")
-        return None, None
-
-def analyze_podcast_with_gemini(transcript_text):
-    model = genai.GenerativeModel('gemini-1.5-pro')
-    prompt = f"""
-    أنت خبير مونتاج وتسويق عبر الفيديوهات القصيرة (Reels & TikTok). 
-    أمامك نص بودكاست بالهجة الجزائرية. أريدك أن تحلل النص وتستخرج أفضل 3 مقاطع حماسية ومفيدة جداً.
-    كل مقطع مدته بين 30 إلى 50 ثانية.
-    أعطني النتيجة حصرياً بصيغة JSON تحتوي على قائمة بالشكل التالي بدون أي نصوص إضافية:
-    [
-      {{
-        "start_time": "الوقت بالثواني لبداية المقطع",
-        "end_time": "الوقت بالثواني لنهاية المقطع",
-        "title": "عنوان جذاب للشورت"
-      }}
-    ]
-    إليك النص:
-    {transcript_text[:30000]}
-    """
-    response = model.generate_content(prompt)
-    try:
-        clean_text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean_text)
-    except Exception as e:
-        print(f"خطأ في تحليل الذكاء الاصطناعي: {e}")
+        print(f"خطأ في التحليل الصوتي عبر Gemini: {e}")
         return []

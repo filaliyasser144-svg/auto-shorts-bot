@@ -3,7 +3,7 @@ import json
 from youtube_transcript_api import YouTubeTranscriptApi
 import google.generativeai as genai
 
-# إعداد مفتاح Gemini API (سيتم سحبه من GitHub Secrets لاحقاً)
+# إعداد مفتاح Gemini API
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -17,16 +17,23 @@ def get_youtube_transcript(video_url):
         else:
             raise ValueError("رابط يوتيوب غير صالح")
             
-        # جلب النص التلقائي للفيديو
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ar', 'en'])
-        full_text = " ".join([item['text'] for item in transcript_list])
-        return full_text, transcript_list
+        # استخدام الطريقة الآمنة الحديثة لجلب النص
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        
+        # محاولة البحث عن العربية أو الإنجليزية أو أزي كود متاحة
+        try:
+            transcript = transcript_list.find_transcript(['ar', 'en'])
+        except:
+            transcript = transcript_list.find_generated_transcript(['ar', 'en'])
+            
+        transcript_data = transcript.fetch()
+        full_text = " ".join([item['text'] for item in transcript_data])
+        return full_text, transcript_data
     except Exception as e:
         print(f"خطأ في جلب النص: {e}")
         return None, None
 
 def analyze_podcast_with_gemini(transcript_text):
-    # اختيار نموذج Gemini الذكي
     model = genai.GenerativeModel('gemini-1.5-pro')
     
     prompt = f"""
@@ -50,7 +57,6 @@ def analyze_podcast_with_gemini(transcript_text):
     
     response = model.generate_content(prompt)
     try:
-        # تنظيف الرد واستخراج الجايسون
         clean_text = response.text.replace("```json", "").replace("```", "").strip()
         clips_data = json.loads(clean_text)
         return clips_data
@@ -59,7 +65,6 @@ def analyze_podcast_with_gemini(transcript_text):
         return []
 
 if __name__ == "__main__":
-    # تجربة محلية افتراضية
     test_url = input("أدخل رابط يوتيوب للبودكاست: ")
     text, raw_list = get_youtube_transcript(test_url)
     if text:

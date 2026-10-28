@@ -1,0 +1,63 @@
+name: Shorts Factory
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "YouTube video / live / podcast URL"
+        required: true
+      language:
+        description: "ar / en / auto"
+        default: "ar"
+      clips:
+        description: "How many shorts"
+        default: "5"
+
+jobs:
+  make:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # recent yt-dlp versions need a JavaScript runtime for YouTube
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: System packages
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg libgl1 libglib2.0-0
+
+      - name: Python packages
+        run: |
+          pip install -r requirements.txt
+          pip install -U "yt-dlp[default]"
+
+      - name: YouTube cookies (optional)
+        env:
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+        run: |
+          if [ -n "$YT_COOKIES" ]; then printf '%s' "$YT_COOKIES" > cookies.txt; fi
+
+      - name: Make shorts
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          URL: ${{ inputs.url }}
+          LANG_CODE: ${{ inputs.language }}
+          CLIPS: ${{ inputs.clips }}
+        run: python src/pipeline.py --url "$URL" --lang "$LANG_CODE" --clips "$CLIPS"
+
+      - name: Save full-quality shorts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shorts
+          path: out/
+          retention-days: 7
